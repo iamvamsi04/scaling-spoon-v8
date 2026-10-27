@@ -1,0 +1,11 @@
+autogen-agentchat==0.7.5
+autogen-ext[openai,mcp]==0.7.5
+mcp>=1.30,<2
+openai>=1.93,<2
+fastmcp>=2.12,<3
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+streamlit>=1.45,<2
+reportlab>=4.4,<5
+python-dotenv>=1.1,<2
+httpx>=0.28,<1
