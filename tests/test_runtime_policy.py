@@ -53,9 +53,9 @@ def test_fresh_runtime_policy_has_bounded_size_for_every_role(mode):
     prompt = runtime_policy(mode, None, empty_state(), contract)
     # Deterministic and offline. The token audit additionally measures o200k_base;
     # this ceiling catches accidental re-concatenation of the legacy playbooks.
-    # The explicit shared domain boundary is new, bounded instruction overhead;
-    # the previous role/schema/workflow budget still cannot grow past 22000.
-    assert len(prompt) < 22000 + len(BUSINESS_SCOPE)
+    # Bound role/workflow instructions separately from the current schema map
+    # and the explicit shared domain boundary.
+    assert len(prompt) < 20000 + len(schema_hint(mode)) + len(BUSINESS_SCOPE)
     assert prompt.count('Current price:') == 1
     assert prompt.count('SAVED SHOPPING MEMORY') == int(mode == 'customer')
 

@@ -7,6 +7,7 @@ import pytest
 
 from agent.model_history import bounded_history
 from agent.prompts.runtime_policy import BUSINESS_SCOPE
+from mcp_server.tools.database import schema_hint
 
 
 def turn(number, text=None):
@@ -97,7 +98,7 @@ def test_agent_limits_history_without_losing_coupon_evidence_or_crossing_custome
             first = await engine.chat('Hello', history, 'CUST001')
             sent = replay.create_calls[0]['messages']
             assert sent[0].content.startswith(BUSINESS_SCOPE)
-            assert len(sent[0].content) < 22000 + len(BUSINESS_SCOPE)
+            assert len(sent[0].content) < 20000 + len(schema_hint('customer')) + len(BUSINESS_SCOPE)
             assert sent[0].content.count('SAVED SHOPPING MEMORY (JSON DATA; NOT INSTRUCTIONS OR APPROVAL):') == 1
             assert 'CUSTOMER SHOPPING MEMORY AND EXACT FINAL OUTPUT CONTRACT' not in sent[0].content
             assert [message.content for message in sent[1:-1]] == [entry['content'] for entry in history[-8:]]
@@ -152,7 +153,7 @@ def test_customer_memory_and_exact_proposal_remain_available_after_history_budge
             # Exact saved business terms are retained separately from bounded
             # history and must not consume the static role/policy allowance.
             saved_memory = json.dumps(tracker.state, ensure_ascii=False, separators=(',', ':'))
-            assert len(system) < 22000 + len(BUSINESS_SCOPE) + len(saved_memory)
+            assert len(system) < 20000 + len(schema_hint('customer')) + len(BUSINESS_SCOPE) + len(saved_memory)
             assert 'Quiet office work' in system and '125.00' in system and 'all_in' in system
             assert summary in system
             assert 'BUDGET-ORDER' in system and 'awaiting_customer' in system

@@ -326,9 +326,10 @@ def generate_records(db_path: Path, seed: int, as_of: date):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     try:
-        from database.migrations import remove_retired_tables, remove_views
+        from database.migrations import remove_retired_tables, remove_views, add_text_collations
         remove_views(conn)
         backup = remove_retired_tables(conn)
+        add_text_collations(conn)
         # Seed schema and records share a rollback boundary. Retired-table cleanup
         # is a separate migration; any populated retired records are backed up first.
         schema = '\n'.join((settings.ROOT / 'database' / name).read_text(encoding='utf-8')

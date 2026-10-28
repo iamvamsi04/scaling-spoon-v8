@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from threading import RLock
 from config import settings
-from database.connection import connect
+from database.connection import CASE_INSENSITIVE_COLUMNS, connect
 from database.product_search import normalize_product_filters, register_product_search
 
 TABLES = {'billing_config', 'customers', 'items', 'promotions', 'orders',
@@ -91,6 +91,14 @@ def schema_hint(mode='customer'):
                 if fk['table'] in columns and fk['from'] in columns[table] and fk['to'] in columns[fk['table']]:
                     joins.append(f'{table}.{fk["from"]} = {fk["table"]}.{fk["to"]}')
         lines.append('Declared join keys: ' + '; '.join(joins))
+        insensitive = [f'{table}.{name}' for table, names in columns.items()
+                       for name in names if name.casefold() in CASE_INSENSITIVE_COLUMNS.get(table, ())]
+        lines.append('Case-insensitive descriptive columns (COLLATE NOCASE): ' + ', '.join(insensitive)
+                     + '. Other columns retain their declared comparison rules.')
+        lines.append("Canonical status values: orders.order_status=draft/placed/cancelled; "
+                     "order_details.status=active/cancelled; refund_requests.status=pending/approved; "
+                     "order_service.fulfillment_status=unknown/placed/shipped/delivered/cancelled. "
+                     "Use canonical lowercase values for writes.")
         lines.append('Aggregate each one-to-many side before combining totals. Missing columns are unavailable; do not invent them.')
         lines.append('Product search: product_matches(i.name, ?) or product_matches(d.category, ?) matches words/phrases regardless of case, spaces, underscores, hyphens and common plurals. Use only on product text; IDs, prices and other fields keep exact semantics.')
         hint = '\n'.join(lines)

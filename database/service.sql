@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS customer_billing_details (
 );
 CREATE TABLE IF NOT EXISTS order_service (
  order_id TEXT PRIMARY KEY REFERENCES orders(order_id),
- fulfillment_status TEXT NOT NULL DEFAULT 'unknown' CHECK(fulfillment_status IN ('unknown','placed','shipped','delivered','cancelled')),
+ fulfillment_status TEXT COLLATE NOCASE NOT NULL DEFAULT 'unknown' CHECK(fulfillment_status COLLATE BINARY IN ('unknown','placed','shipped','delivered','cancelled')),
  shipped_at TEXT, delivered_at TEXT, cancelled_at TEXT, cancellation_restocked INTEGER NOT NULL DEFAULT 0,
  credit_requested DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK(credit_requested>=0),
  review_note TEXT, review_requested_at TEXT

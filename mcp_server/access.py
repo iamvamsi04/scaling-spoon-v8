@@ -4,7 +4,7 @@ from contextlib import closing
 from functools import wraps
 import inspect
 import sqlite3
-from database.connection import connect
+from database.connection import CASE_INSENSITIVE_COLUMNS, connect
 
 scope = ContextVar('tool_scope', default=None)
 ADMIN_TOOLS = {'execute_sql_query', 'billing_analysis', 'billing_anomalies', 'download_invoice', 'process_refund', 'manage_draft'}
@@ -58,7 +58,8 @@ def customer_query_connection(customer_id, staff=False):
     """Materialize only public products and associated customer rows in an isolated DB.
 
     User SQL never touches the source connection, preventing joins, CTEs and main.table
-    qualification from bypassing a row filter. Original column names are preserved.
+    qualification from bypassing a row filter. Original column names and selected
+    descriptive-text collations are preserved; identifiers retain binary matching.
     """
     source, target = connect(readonly=True), sqlite3.connect(':memory:')
     target.row_factory = sqlite3.Row
@@ -88,7 +89,9 @@ def customer_query_connection(customer_id, staff=False):
                 sql = sql.replace(' WHERE customer_id=?', '').replace(' WHERE o.customer_id=?', '')
             cursor = source.execute(sql, (customer_id,) if '?' in sql else ())
             columns = [c[0] for c in cursor.description]
-            target.execute('CREATE TABLE '+table+' ('+', '.join('"'+c+'"' for c in columns)+')')
+            nocase = CASE_INSENSITIVE_COLUMNS.get(table, ())
+            declarations = ['"'+c+'"' + (' COLLATE NOCASE' if c.casefold() in nocase else '') for c in columns]
+            target.execute('CREATE TABLE '+table+' ('+', '.join(declarations)+')')
             target.executemany('INSERT INTO '+table+' VALUES ('+','.join('?' for _ in columns)+')', cursor.fetchall())
         target.commit()
         return target

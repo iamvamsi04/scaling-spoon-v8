@@ -88,6 +88,12 @@ Current price: one price_history row active inclusively at CURRENT_DATE supplies
 falls back to sellingprice; overlapping rows are ambiguous, never choose MIN/MAX/LIMIT. Draft prices
 use order_date; issued prices/quantities use invoice_lines. Never rewrite history using current prices.
 orders.order_status=draft/placed/cancelled is lifecycle; invoice presence/shipping status is different.
+Descriptive name/category/status columns listed in the table map compare case-insensitively; stored
+labels are unchanged. Exact identifiers, credentials and financial fields retain their own rules.
+TRIM/COALESCE/CASE and other computed text can lose a column's collation: apply COLLATE NOCASE to
+the complete descriptive expression, or normalize BOTH comparison operands with LOWER(TRIM(...)).
+Do not normalize IDs, coupon identifiers, passwords, tokens, amounts, dates or case-sensitive units.
+Pending customer refund requests are refund_requests.status='pending'; approved requests use 'approved'.
 Active billed sales require placed, excluding cancelled order_details.status/order_service.fulfillment_status.
 Aggregate subtotal/discount/tax/shipping/charged/refund ONCE per order; aggregate one-to-many lines
 separately before joining. Product revenue=invoice_lines.line_total BEFORE order-level adjustments.

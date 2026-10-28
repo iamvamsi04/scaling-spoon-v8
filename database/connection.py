@@ -6,6 +6,19 @@ from config import settings
 
 audit_context = ContextVar('billing_audit', default=None)
 
+# Human-readable labels and lifecycle values only. Identifiers and credentials
+# deliberately retain their original exact comparison rules.
+CASE_INSENSITIVE_COLUMNS = {
+    'customers': frozenset({'name'}),
+    'items': frozenset({'name'}),
+    'product_details': frozenset({'category'}),
+    'product_attributes': frozenset({'attribute'}),
+    'orders': frozenset({'order_status', 'refund_status'}),
+    'order_details': frozenset({'status'}),
+    'refund_requests': frozenset({'status'}),
+    'order_service': frozenset({'fulfillment_status'}),
+}
+
 
 def connect(readonly=False):
     if readonly:
@@ -42,7 +55,7 @@ def initialize():
     try:
         conn.execute('PRAGMA journal_mode=WAL')
         from database.migrations import (remove_retired_tables, remove_views, add_promotion_expiry,
-                                         add_unknown_fulfillment, add_order_status)
+                                         add_unknown_fulfillment, add_order_status, add_text_collations)
         remove_views(conn)
         remove_retired_tables(conn)
         conn.executescript((settings.ROOT / 'database/schema.sql').read_text())
@@ -55,5 +68,6 @@ def initialize():
         conn.executemany('INSERT OR IGNORE INTO billing_config(key,value) VALUES (?,?)',
                          [('tax_rate', '0'), ('shipping_amount', '0'), ('currency', 'USD')])
         conn.commit()
+        add_text_collations(conn)
     finally:
         conn.close()
