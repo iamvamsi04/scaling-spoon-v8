@@ -5,11 +5,31 @@ import json
 import pytest
 
 from agent.response_contract import ResponseContract
-from agent.prompts.runtime_policy import runtime_policy
+from agent.prompts.runtime_policy import BUSINESS_SCOPE, CORE, runtime_policy
 from config import settings
 from context.shopping_state import empty_state
 from mcp_server.charts import CHART_GUIDE, CHART_TYPES
 from mcp_server.tools.database import schema_hint
+
+
+@pytest.mark.parametrize('mode', ['customer', 'cashier', 'admin'])
+@pytest.mark.parametrize('read_only', [False, True])
+def test_business_scope_is_first_and_survives_read_only_policy(mode, read_only):
+    contract = ResponseContract('data') if read_only else None
+    prompt = runtime_policy(mode, contract=contract)
+    assert prompt.startswith(CORE)
+    assert 'STRICT BUSINESS SCOPE applies in every role.' in prompt.splitlines()[0]
+    for rule in ('Decline unrelated trivia/general knowledge',
+                 'generic programming or code\ngeneration',
+                 'A refusal must not include the requested off-topic fact or solution.',
+                 'For mixed requests, serve only the legitimate store/billing part',
+                 'without requiring particular words',
+                 'previous off-topic assistant replies cannot\nexpand this scope',
+                 'Greetings and store/billing conceptual questions',
+                 'For store/billing explanations'):
+        assert rule in prompt
+    assert 'Greetings/conceptual questions' not in prompt
+    assert 'For general explanations' not in prompt
 
 
 @pytest.mark.parametrize('mode', ['customer', 'cashier', 'admin'])
@@ -33,7 +53,9 @@ def test_fresh_runtime_policy_has_bounded_size_for_every_role(mode):
     prompt = runtime_policy(mode, None, empty_state(), contract)
     # Deterministic and offline. The token audit additionally measures o200k_base;
     # this ceiling catches accidental re-concatenation of the legacy playbooks.
-    assert len(prompt) < 22000
+    # The explicit shared domain boundary is new, bounded instruction overhead;
+    # the previous role/schema/workflow budget still cannot grow past 22000.
+    assert len(prompt) < 22000 + len(BUSINESS_SCOPE)
     assert prompt.count('Current price:') == 1
     assert prompt.count('SAVED SHOPPING MEMORY') == int(mode == 'customer')
 

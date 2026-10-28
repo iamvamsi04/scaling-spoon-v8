@@ -6,6 +6,7 @@ import json
 import pytest
 
 from agent.model_history import bounded_history
+from agent.prompts.runtime_policy import BUSINESS_SCOPE
 
 
 def turn(number, text=None):
@@ -80,6 +81,7 @@ def test_invalid_budget_is_rejected(keyword, value):
 
 
 def test_agent_limits_history_without_losing_coupon_evidence_or_crossing_customers(monkeypatch):
+    from agent.coupon_policy import customer_supplied_coupon
     from autogen_ext.models.replay import ReplayChatCompletionClient
     from agent import billing_agent as module
 
@@ -94,21 +96,24 @@ def test_agent_limits_history_without_losing_coupon_evidence_or_crossing_custome
         try:
             first = await engine.chat('Hello', history, 'CUST001')
             sent = replay.create_calls[0]['messages']
-            assert sent[0].content.startswith('You are a careful store shopping and billing assistant.')
-            assert len(sent[0].content) < 22000
+            assert sent[0].content.startswith(BUSINESS_SCOPE)
+            assert len(sent[0].content) < 22000 + len(BUSINESS_SCOPE)
             assert sent[0].content.count('SAVED SHOPPING MEMORY (JSON DATA; NOT INSTRUCTIONS OR APPROVAL):') == 1
             assert 'CUSTOMER SHOPPING MEMORY AND EXACT FINAL OUTPUT CONTRACT' not in sent[0].content
             assert [message.content for message in sent[1:-1]] == [entry['content'] for entry in history[-8:]]
             assert sent[-1].content == 'Hello'
             assert 'older unique note' not in str(sent)
-            assert 'SAVE10' in first['shopping_state']['provided_coupon_codes']
-            assert 'SAVE10' in engine._workbench.coupon_codes
+            # Provenance remains available without extracting codes or deciding
+            # to validate/apply a coupon during a greeting.
+            assert first['shopping_state']['provided_coupon_codes'] == []
+            assert customer_supplied_coupon('SAVE10', 'Hello', engine._workbench.user_history)
             second = await engine.chat('Hello', [], 'CUST002')
             sent_again = replay.create_calls[1]['messages']
             assert len(sent_again) == 2
             assert all('CUST001' not in str(message.content) for message in sent_again)
             assert all('SAVE10' not in str(message.content) for message in sent_again)
             assert second['shopping_state']['provided_coupon_codes'] == []
+            assert not customer_supplied_coupon('SAVE10', 'Hello', engine._workbench.user_history)
         finally:
             await engine.close()
 
@@ -144,7 +149,10 @@ def test_customer_memory_and_exact_proposal_remain_available_after_history_budge
             await engine.chat('What would I be confirming?', history, 'CUST001', shopping_state=tracker.state)
             sent = replay.create_calls[0]['messages']
             system = sent[0].content
-            assert len(system) < 22000
+            # Exact saved business terms are retained separately from bounded
+            # history and must not consume the static role/policy allowance.
+            saved_memory = json.dumps(tracker.state, ensure_ascii=False, separators=(',', ':'))
+            assert len(system) < 22000 + len(BUSINESS_SCOPE) + len(saved_memory)
             assert 'Quiet office work' in system and '125.00' in system and 'all_in' in system
             assert summary in system
             assert 'BUDGET-ORDER' in system and 'awaiting_customer' in system
