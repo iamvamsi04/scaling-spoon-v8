@@ -53,27 +53,26 @@ def provision(client, customer='CUST001', password=PASSWORD):
     return {'X-Customer-Token': result['token']}
 
 
-def test_former_account_default_cannot_sign_in_or_be_chosen(client):
+def test_account_default_can_sign_in_be_set_and_used_for_registration(client):
     from api import customer_auth
-    legacy = 'CUST001-Store!2026'
-    with closing(connect()) as conn:
-        conn.execute('INSERT INTO customer_credentials(customer_id,password_hash) VALUES (?,?)',
-                     ('CUST001', customer_auth.password_hash(legacy)))
-        conn.commit()
-    result = client.post('/customers/login', json={'customer_id': 'CUST001', 'password': legacy})
-    assert result.status_code == 401
-    with pytest.raises(ValueError, match='former account default'):
-        customer_auth.set_password('CUST001', legacy)
-    with pytest.raises(ValueError, match='former account default'):
-        customer_auth.register('NEW-ACCOUNT', 'New account', 'NEW-ACCOUNT-Store!2026')
+    default = 'CUST001-Store!2026'
+    customer_auth.set_password('CUST001', default)
+    result = client.post('/customers/login', json={'customer_id': 'CUST001', 'password': default})
+    assert result.status_code == 200
+    assert customer_auth.customer_for_token(result.json()['token']) == 'CUST001'
+    account = customer_auth.register('NEW-ACCOUNT', 'New account', 'NEW-ACCOUNT-Store!2026')
+    assert customer_auth.customer_for_token(account['token']) == 'NEW-ACCOUNT'
     with closing(connect(readonly=True)) as conn:
-        assert not conn.execute("SELECT 1 FROM customers WHERE customer_id='NEW-ACCOUNT'").fetchone()
-        assert conn.execute('SELECT COUNT(*) FROM customer_sessions').fetchone()[0] == 0
+        stored = conn.execute("SELECT password_hash FROM customer_credentials WHERE customer_id='CUST001'").fetchone()[0]
+        assert default not in stored
+        assert customer_auth.verify_password(default, stored)
     customer_auth.set_password('CUST001', PASSWORD)
+    assert customer_auth.customer_for_token(result.json()['token']) is None
+    assert client.post('/customers/login', json={'customer_id': 'CUST001', 'password': default}).status_code == 401
     assert client.post('/customers/login', json={'customer_id': 'CUST001', 'password': PASSWORD}).status_code == 200
 
 
-def test_customer_passwords_support_unicode_without_legacy_comparison_errors(client):
+def test_customer_passwords_support_unicode(client):
     from api import customer_auth
     password = 'A secure password café 東京 2026'
     customer_auth.set_password('CUST001', password)

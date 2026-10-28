@@ -46,32 +46,18 @@ def headers(account):
     return {'X-Customer-Token': account['token']}
 
 
-def test_legacy_default_sessions_are_blocked_and_hash_changes_invalidate_cached_checks(monkeypatch):
-    legacy = customer_auth.password_hash('CUST001-Store!2026')
-    custom = customer_auth.password_hash(PASSWORD)
-    with transaction() as conn:
-        conn.execute('INSERT INTO customer_credentials(customer_id,password_hash) VALUES (?,?)', ('CUST001', legacy))
-        account = customer_auth.new_session(conn, 'CUST001')
-    original_verify = customer_auth.verify_password
-    checked = []
-    def verify(password, encoded):
-        checked.append(encoded)
-        return original_verify(password, encoded)
-    customer_auth.uses_legacy_default.cache_clear()
-    monkeypatch.setattr(customer_auth, 'verify_password', verify)
-    assert customer_auth.session_for_token(account['token']) is None
-    assert customer_auth.session_for_token(account['token']) is None
-    assert checked == [legacy]
-    # An independently changed hash must not reuse the old credential's result.
-    with transaction() as conn:
-        conn.execute('UPDATE customer_credentials SET password_hash=? WHERE customer_id=?', (custom, 'CUST001'))
+def test_default_password_sessions_work_and_reset_still_revokes_them():
+    default = 'CUST001-Store!2026'
+    customer_auth.set_password('CUST001', default)
+    account = customer_auth.login('CUST001', default)
+    assert account is not None
     assert customer_auth.customer_for_token(account['token']) == 'CUST001'
-    assert customer_auth.customer_for_token(account['token']) == 'CUST001'
-    assert checked == [legacy, custom]
-    with transaction() as conn:
-        conn.execute('UPDATE customer_credentials SET password_hash=? WHERE customer_id=?', (legacy, 'CUST001'))
+    customer_auth.set_password('CUST001', PASSWORD)
     assert customer_auth.session_for_token(account['token']) is None
-    assert checked == [legacy, custom]
+    assert customer_auth.login('CUST001', default) is None
+    replacement = customer_auth.login('CUST001', PASSWORD)
+    assert replacement is not None
+    assert customer_auth.customer_for_token(replacement['token']) == 'CUST001'
 
 
 def test_real_token_matches_stored_hash_but_hash_itself_cannot_authenticate(client):

@@ -1,7 +1,6 @@
 """Local customer sign-in. Passwords never pass through the chat agent."""
 import argparse
 from contextlib import closing
-from functools import lru_cache
 import getpass
 import hashlib
 import hmac
@@ -40,23 +39,6 @@ def verify_password(password, encoded):
         return False
 
 
-def is_legacy_default_password(customer_id, password):
-    return isinstance(password, str) and hmac.compare_digest(
-        password.encode(), f'{customer_id}-Store!2026'.encode())
-
-
-def validate_customer_password(customer_id, password):
-    validate_password(password)
-    if is_legacy_default_password(customer_id, password):
-        raise ValueError('Choose a password different from the former account default.')
-
-
-@lru_cache(maxsize=1024)
-def uses_legacy_default(customer_id, encoded):
-    """Cache by hash too, so changing a credential immediately changes the check."""
-    return verify_password(f'{customer_id}-Store!2026', encoded)
-
-
 def new_session(conn, customer_id):
     now = int(time.time())
     token = secrets.token_urlsafe(32)
@@ -75,7 +57,6 @@ def register(customer_id, name, password, company=None, email=None):
     for value in (company, email):
         if value is not None and (not isinstance(value, str) or len(value) > 200):
             raise ValueError('Company and email must be text of at most 200 characters.')
-    validate_customer_password(customer_id, password)
     encoded = password_hash(password)
     with transaction() as conn:
         # Existing records require local onboarding. Knowing an ID or email is not proof of ownership.
@@ -90,7 +71,6 @@ def register(customer_id, name, password, company=None, email=None):
 
 def set_password(customer_id, password):
     """Trusted local onboarding/reset only; deliberately has no HTTP or model tool route."""
-    validate_customer_password(customer_id, password)
     encoded = password_hash(password)
     with transaction() as conn:
         if not conn.execute('SELECT 1 FROM customers WHERE customer_id=?', (customer_id,)).fetchone():
@@ -107,7 +87,7 @@ def login(customer_id, password):
         record = conn.execute('SELECT * FROM customer_credentials WHERE customer_id=?', (customer_id,)).fetchone()
     # Also perform a hash for unknown users, so an ID is not disclosed by a quick rejection.
     encoded = record['password_hash'] if record else f'pbkdf2_sha256${ITERATIONS}${"00" * 16}${"00" * 32}'
-    matched = verify_password(password, encoded) and not is_legacy_default_password(customer_id, password)
+    matched = verify_password(password, encoded)
     now = int(time.time())
     with transaction() as conn:
         current = conn.execute('SELECT * FROM customer_credentials WHERE customer_id=?', (customer_id,)).fetchone()
@@ -130,11 +110,11 @@ def session_for_token(token):
     digest = hashlib.sha256(token.encode()).hexdigest()
     now = int(time.time())
     with closing(connect(readonly=True)) as conn:
-        record = conn.execute("SELECT s.customer_id,s.expires_at,c.password_hash FROM customer_sessions s "
+        record = conn.execute("SELECT s.customer_id,s.expires_at FROM customer_sessions s "
                               "JOIN customer_credentials c ON c.customer_id=s.customer_id WHERE s.token_hash=? "
                               "AND typeof(s.expires_at)='integer' AND s.expires_at>?",
                               (digest, now)).fetchone()
-        if record and not uses_legacy_default(record['customer_id'], record['password_hash']):
+        if record:
             return {'customer_id': record['customer_id'], 'expires_at': record['expires_at'],
                     'expires_in': record['expires_at'] - now}
         return None

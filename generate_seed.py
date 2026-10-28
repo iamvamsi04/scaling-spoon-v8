@@ -7,8 +7,7 @@ Existing active records/config are preserved. Retired payment/credit records are
 Refuse batches exceeding 500 main-table rows.
 Upgrades existing datasets with product details and service scenarios.
 Seed markers make reruns repeatable without duplicate inserts.
-Set each generated customer's sign-in password locally with
-python -m api.customer_auth --customer-id CUSTOMER_ID.
+Each generated customer initially uses <customer_id>-Store!2026 to sign in.
 Only salted password hashes are saved; existing passwords are preserved.
 Billing records are validated and committed first. Password setup runs in
 parallel batches and resumes missing accounts after an interruption.
@@ -23,7 +22,6 @@ import json
 import os
 from pathlib import Path
 import random
-import secrets
 import sqlite3
 import sys
 from time import perf_counter
@@ -267,7 +265,7 @@ def audit(conn, opening_stock):
 
 
 def seed_customer_passwords(conn, workers=PASSWORD_WORKERS, progress=None):
-    """Save unexported random initial hashes; local onboarding sets sign-in passwords."""
+    """Save initial password hashes only for generated accounts without credentials."""
     from api.customer_auth import password_hash
     prefix = seed_layout(conn)[0]
     missing = conn.execute(
@@ -290,7 +288,7 @@ def seed_customer_passwords(conn, workers=PASSWORD_WORKERS, progress=None):
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for start in range(0, len(missing), PASSWORD_BATCH_SIZE):
             batch = missing[start:start + PASSWORD_BATCH_SIZE]
-            pending = {pool.submit(password_hash, secrets.token_urlsafe(32)): row[0] for row in batch}
+            pending = {pool.submit(password_hash, row[0] + '-Store!2026'): row[0] for row in batch}
             prepared = []
             try:
                 for job in as_completed(pending):
