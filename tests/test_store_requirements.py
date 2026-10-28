@@ -159,9 +159,11 @@ def test_required_service_scenarios(case,monkeypatch):
 def test_credit_cannot_be_double_spent_across_drafts():
     source=order();assert request(source,amount='79.90',disposition='store_credit')['ok'];assert approve(source,return_received=True)['ok']
     drafts=[order(qty=1,placed=False),order(qty=1,placed=False)]
-    for oid in drafts: assert manage_draft(oid,'CUST001','apply_store_credit',credit_amount='79.90',confirmed=True)['ok']
+    assert manage_draft(drafts[0],'CUST001','apply_store_credit',credit_amount='79.90',confirmed=True)['ok']
+    assert not manage_draft(drafts[1],'CUST001','apply_store_credit',credit_amount='79.90',confirmed=True)['ok']
     with ThreadPoolExecutor(2) as pool: results=list(pool.map(lambda oid:place_order(oid,'CUST001'),drafts))
-    assert sum(r['ok'] for r in results)==1
+    assert all(r['ok'] for r in results)
+    assert sorted(Decimal(r['store_credit_applied']) for r in results)==[Decimal('0.00'),Decimal('79.90')]
     assert scalar('SELECT SUM(amount) FROM store_credit_ledger')==0
 
 

@@ -46,7 +46,7 @@ def test_full_seed_is_consistent_and_idempotent(tmp_path):
         assert len({row[1] for row in encoded})==400
         assert all(value.startswith('pbkdf2_sha256$600000$') for _,value in encoded)
         for customer_id,value in (encoded[0], encoded[-1]):
-            assert verify_password(customer_id+'-Store!2026', value)
+            assert not verify_password(customer_id+'-Store!2026', value)
             assert customer_id+'-Store!2026' not in value
         assert not conn.execute('SELECT c.customer_id FROM customers c LEFT JOIN customer_credentials a ON a.customer_id=c.customer_id WHERE a.customer_id IS NULL').fetchall()
         assert not list(path.parent.glob('*.csv'))
@@ -105,7 +105,9 @@ def test_existing_large_dataset_gets_missing_passwords_without_resets(monkeypatc
     after = snapshot(settings.BILLING_DB)
     assert all(after[table]==rows for table,rows in existing.items() if table!='customer_credentials')
     assert set(existing['customer_credentials']) <= set(after['customer_credentials'])
-    assert login('FAKE-CUST-0001','FAKE-CUST-0001-Store!2026')
+    assert not login('FAKE-CUST-0001','FAKE-CUST-0001-Store!2026')
+    set_password('FAKE-CUST-0001','A separately chosen account password')
+    assert login('FAKE-CUST-0001','A separately chosen account password')
     assert login('FAKE-CUST-0002','Previously chosen password')
     assert not login('FAKE-CUST-0002','FAKE-CUST-0002-Store!2026')
     assert seed.generate(settings.BILLING_DB,42,date.today())['customer_passwords_added']==0
@@ -161,7 +163,7 @@ def test_interrupted_password_batches_resume_without_resets(monkeypatch):
         after=conn.execute('SELECT customer_id,password_hash FROM customer_credentials ORDER BY customer_id').fetchall()
     assert after[0]==first[0]
     assert len(after)==3
-    assert all(customer_auth.verify_password(cid+'-Store!2026',encoded) for cid,encoded in after)
+    assert all(not customer_auth.verify_password(cid+'-Store!2026',encoded) for cid,encoded in after)
 
 
 def test_password_setup_preserves_a_password_changed_while_hashing(monkeypatch):
@@ -169,8 +171,11 @@ def test_password_setup_preserves_a_password_changed_while_hashing(monkeypatch):
     original_hash = customer_auth.password_hash
     with sqlite3.connect(settings.BILLING_DB) as conn:
         conn.execute("INSERT INTO customers VALUES ('STORE-CUST-0001','Alex',NULL,NULL)")
+    changed = False
     def concurrently_changed(password):
-        if password.endswith('-Store!2026'):
+        nonlocal changed
+        if not changed:
+            changed = True
             customer_auth.set_password('STORE-CUST-0001','A customer chosen password')
         return original_hash(password)
     monkeypatch.setattr(customer_auth,'password_hash',concurrently_changed)
@@ -178,6 +183,27 @@ def test_password_setup_preserves_a_password_changed_while_hashing(monkeypatch):
         assert seed.seed_customer_passwords(conn)==0
     assert customer_auth.login('STORE-CUST-0001','A customer chosen password')
     assert not customer_auth.login('STORE-CUST-0001','STORE-CUST-0001-Store!2026')
+
+
+def test_seed_initial_passwords_are_independent_unexported_secrets(monkeypatch, capsys):
+    from api import customer_auth
+    original_hash = customer_auth.password_hash
+    prepared = []
+    def record(password):
+        prepared.append(password)
+        return original_hash(password)
+    monkeypatch.setattr(customer_auth, 'password_hash', record)
+    with sqlite3.connect(settings.BILLING_DB) as conn:
+        conn.executemany('INSERT INTO customers VALUES (?,?,NULL,NULL)',
+                         [('STORE-CUST-0001', 'Alex'), ('STORE-CUST-0002', 'Sam')])
+        conn.commit()
+        progress = []
+        assert seed.seed_customer_passwords(conn, progress=progress.append) == 2
+        stored = conn.execute('SELECT password_hash FROM customer_credentials').fetchall()
+    assert len(prepared) == len(set(prepared)) == 2
+    assert all(len(value) >= 40 and 'STORE-CUST' not in value for value in prepared)
+    output = repr(progress) + repr(stored) + capsys.readouterr().out
+    assert all(value not in output for value in prepared)
 
 
 def legacy_tables(conn):

@@ -124,7 +124,7 @@ def sql_text(query):
     return re.sub(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'", ' ', str(query)).casefold()
 
 
-def _inventory_recipe(query):
+def _inventory_recipe(query, columns):
     # Prove a small family of equivalent one-row-per-item queries. Arbitrary
     # joins or CTEs cannot establish complete inventory from aliases alone.
     tokens = re.findall(r"'(?:''|[^'])*'|--[^\n]*|/\*[\s\S]*?\*/|[^']+?", str(query))
@@ -133,29 +133,46 @@ def _inventory_recipe(query):
     clean = re.sub(r'["`\[\]]', '', clean)
     expression = r"coalesce\((?:nullif\((?:trim\(d\.category\)|d\.category),''\)|d\.category),'uncategorised'\)"
     count = r'count\((?:\*|distincti\.item_code)\)'
-    pattern = (rf'select{expression}ascategory,{count}asproducts,'
-        r'sum\(casewheni\.availablequantity>0then1else0end\)asin_stock_products'
+    projection = (rf'{count}asproduct_count' if columns == ['category', 'product_count'] else
+        rf'{count}asproducts,sum\(casewheni\.availablequantity>0then1else0end\)asin_stock_products')
+    pattern = (rf'select{expression}ascategory,{projection}'
         r'fromitems(?:as)?ileft(?:outer)?joinproduct_details(?:as)?dond\.item_code=i\.item_code'
         rf'groupby(?:category|{expression})orderbycategory(?:asc)?')
     return re.fullmatch(pattern, clean) is not None
 
 
-def inventory_rows(arguments, data):
-    if not data.get('ok') or data.get('truncated') or not _inventory_recipe(arguments.get('query', '')):
+def category_rows(data):
+    """Validate displayed category rows independently of full-inventory coverage."""
+    if (not isinstance(data, dict) or data.get('ok') is not True
+            or type(data.get('truncated', False)) is not bool):
         return None
-    if data.get('columns') != ['category', 'products', 'in_stock_products'] or not isinstance(data.get('rows'), list):
+    columns = data.get('columns')
+    if (columns not in (['category', 'product_count'], ['category', 'products', 'in_stock_products'])
+            or not isinstance(data.get('rows'), list)):
         return None
     result, seen = [], set()
     for row in data['rows']:
-        if not isinstance(row, list) or len(row) != 3:
+        if not isinstance(row, list) or len(row) != len(columns):
             return None
-        category, count, stock = row
-        if not isinstance(category, str) or not category.strip() or category in seen:
+        category, count = row[:2]
+        if (not isinstance(category, str) or not category.strip()
+                or len(category) > 2000 or category in seen):
             return None
-        if type(count) is not int or type(stock) is not int or not 0 <= stock <= count:
+        if type(count) is not int or count < 0:
+            return None
+        if len(row) == 3 and (type(row[2]) is not int or not 0 <= row[2] <= count):
             return None
         seen.add(category)
-        result.append([category, count, stock])
+        result.append(list(row))
+    return result
+
+
+def inventory_rows(arguments, data):
+    if data.get('truncated') or not _inventory_recipe(arguments.get('query', ''), data.get('columns')):
+        return None
+    result = category_rows(data)
+    if result is None:
+        return None
     return sorted(result, key=lambda row: row[0].casefold())
 
 
@@ -231,13 +248,16 @@ def report_reply(contract, receipt):
     name, arguments, data = receipt
     if contract.kind == 'inventory_overview':
         rows = inventory_rows(arguments, data)
-        total, available = sum(row[1] for row in rows), sum(row[2] for row in rows)
+        total = sum(row[1] for row in rows)
         if not rows:
             return 'There are no products in the store. The category table is empty.'
+        stock = ''
+        if data['columns'] == ['category', 'products', 'in_stock_products']:
+            available = sum(row[2] for row in rows)
+            stock = f'{available} product' + ('s are' if available != 1 else ' is') + ' currently in stock. '
         return (f'The store has {total} product' + ('s' if total != 1 else '')
                 + f' across {len(rows)} categor' + ('ies' if len(rows) != 1 else 'y') + '. '
-                + f'{available} product' + ('s are' if available != 1 else ' is') + ' currently in stock. '
-                'The table lists every category. Product counts refer to distinct products, not stock units.')
+                + stock + 'The table lists every category. Product counts refer to distinct products, not stock units.')
     summary = data['summary']
     reply = (f"The report covers {summary['matched_orders']} orders: {summary['invoice_count']} active issued invoices, "
             f"{summary['draft_count']} drafts and {summary['cancelled_count']} cancelled orders. "

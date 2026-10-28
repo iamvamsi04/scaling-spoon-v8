@@ -259,6 +259,65 @@ def test_single_scalar_answer_does_not_add_an_unnecessary_table():
     assert workbench.tables == []
 
 
+def test_scoped_category_navigation_keeps_displayed_labels_bound_parameters_and_truncation():
+    from types import SimpleNamespace
+    from agent.billing_agent import RecordingWorkbench
+    from context.shopping_state import empty_state
+    workbench = RecordingWorkbench()
+    workbench.shopping_tracker = SimpleNamespace(state=empty_state())
+    arguments = {'query': 'SELECT category,COUNT(*) AS product_count FROM product_details WHERE item_code>? GROUP BY category ORDER BY category DESC LIMIT 3',
+                 'parameters': ['ITEM001']}
+    rows = [['monitors', 1], ['Uncategorised', 2], ['Monitors', 3]]
+    workbench.record_result('execute_sql_query', arguments, {'ok': True,
+        'columns': ['category', 'product_count'], 'rows': rows, 'truncated': True})
+    navigation = workbench.shopping_tracker.state['product_query']
+    assert navigation == {'kind': 'category_overview', 'query': arguments['query'],
+        'parameters': ['ITEM001'], 'displayed_categories': ['monitors', 'Uncategorised', 'Monitors'],
+        'row_count': 3, 'truncated': True, 'complete': False}
+    arguments['parameters'].append('changed after dispatch')
+    assert navigation['parameters'] == ['ITEM001']
+    assert [row['Category'] for row in workbench.tables[0]['rows']] == navigation['displayed_categories']
+    assert workbench.tables[0]['columns'] == ['Category', 'Products']
+    assert workbench.tables[0]['truncated']
+    assert 'All products' not in workbench.tables[0]['coverage']
+
+
+def test_category_navigation_marks_its_bounded_memory_without_hiding_displayed_rows():
+    from types import SimpleNamespace
+    from agent.billing_agent import RecordingWorkbench
+    from context.shopping_state import empty_state
+    workbench = RecordingWorkbench()
+    workbench.shopping_tracker = SimpleNamespace(state=empty_state())
+    rows = [[f'Category {number:02d}', 1] for number in range(41)]
+    workbench.record_result('execute_sql_query', {'query': 'SELECT category,COUNT(*) AS product_count FROM product_details GROUP BY category'},
+        {'ok': True, 'columns': ['category', 'product_count'], 'rows': rows, 'truncated': False})
+    navigation = workbench.shopping_tracker.state['product_query']
+    assert navigation['displayed_categories'] == [row[0] for row in rows[:40]]
+    assert navigation['row_count'] == 41 and navigation['truncated'] is True
+    assert len(workbench.tables[0]['rows']) == 41 and workbench.tables[0]['truncated'] is False
+
+
+def test_category_navigation_is_not_saved_when_aggregate_table_budget_drops_it(monkeypatch):
+    from types import SimpleNamespace
+    from agent.billing_agent import RecordingWorkbench
+    from context.shopping_state import empty_state
+    from context import tables
+    workbench = RecordingWorkbench()
+    workbench.shopping_tracker = SimpleNamespace(state=empty_state())
+    workbench.shopping_tracker.state['displayed_product_ids'] = ['ITEM001']
+    earlier = workbench.add_table('Earlier result', ['Name'], [['Keyboard']])
+    byte_size = len(json.dumps(earlier, ensure_ascii=False, allow_nan=False,
+                              separators=(',', ':')).encode('utf-8'))
+    monkeypatch.setattr(tables, 'MAX_TOTAL_BYTES', byte_size)
+    before = deepcopy(workbench.shopping_tracker.state)
+    workbench.record_result('execute_sql_query',
+        {'query': "SELECT category,COUNT(*) AS product_count FROM product_details GROUP BY category"},
+        {'ok': True, 'columns': ['category', 'product_count'], 'rows': [['Keyboards', 1]], 'truncated': False})
+    assert len(workbench.tables) == 2
+    assert sanitize_tables(workbench.tables) == [earlier]
+    assert workbench.shopping_tracker.state == before
+
+
 def test_explicit_chart_and_table_retains_both_presentations():
     from agent.billing_agent import RecordingWorkbench
     workbench = RecordingWorkbench()

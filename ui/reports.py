@@ -5,7 +5,7 @@ from context.reports import csv_bytes, sanitize_reports
 
 
 def render_reports(reports, key):
-    for report in sanitize_reports(reports):
+    for report_index, report in enumerate(sanitize_reports(reports)):
         with st.expander('Download report data'):
             st.text(report['title'])
             coverage = report.get('coverage')
@@ -31,4 +31,4 @@ def render_reports(reports, key):
                 st.caption(label)
                 st.download_button('Download ' + dataset['title'], csv_bytes(dataset),
                     file_name=dataset['name'] + '.csv', mime='text/csv',
-                    key=f"report-{key}-{dataset['name']}")
+                    key=f"report-{key}-{report_index}-{dataset['name']}")

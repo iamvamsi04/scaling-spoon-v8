@@ -113,10 +113,30 @@ def totals(conn, subtotal, promo_code=None, *, check_expiry=True):
                 charged_price=str(money(subtotal - discount + tax + shipping)))
 
 
+def credit_for_total(conn, order_id, total):
+    """Describe draft credit at a proposed total without changing any records."""
+    total = money(total)
+    row = conn.execute('''SELECT o.order_status,COALESCE(s.credit_requested,0)
+        FROM orders o LEFT JOIN order_service s ON s.order_id=o.order_id
+        WHERE o.order_id=?''', (order_id,)).fetchone()
+    credit = money(row[1]) if row else money(0)
+    if row and row[0] == 'draft':
+        credit = min(credit, total)
+    return {'store_credit_requested': str(credit),
+            'remaining_invoice_amount': str(total - credit)}
+
+
 def update_totals(conn, order_id, values):
+    """Keep an existing draft allocation within its revised invoice total."""
     conn.execute("UPDATE orders SET subtotal=:subtotal,discount_applied=:discount_applied,"
                  "tax_amount=:tax_amount,shipping_amount=:shipping_amount,charged_price=:charged_price "
                  "WHERE order_id=:order_id", {**values, "order_id": order_id})
+    credit = credit_for_total(conn, order_id, values['charged_price'])
+    conn.execute('''UPDATE order_service SET credit_requested=? WHERE order_id=?
+        AND EXISTS (SELECT 1 FROM orders o WHERE o.order_id=order_service.order_id
+                    AND o.order_status='draft')''',
+        (credit['store_credit_requested'], order_id))
+    return credit
 
 
 @tool_result
@@ -218,10 +238,11 @@ def apply_promotion(order_id: str | None, customer_id: str, promo_code: str, act
         values = totals(conn, subtotal, promo_code)
         if action == 'validate':
             return {**preview, 'order_id': order_id, 'applied': False, **values,
+                    **credit_for_total(conn, order_id, values['charged_price']),
                     'note': 'Preview only. The coupon has not been applied by this check.'}
         conn.execute("UPDATE orders SET promo_code=? WHERE order_id=?", (promo_code, order_id))
-        update_totals(conn, order_id, values)
-    return {"order_id": order_id, "promo_code": promo_code, 'applied': True, **values}
+        credit = update_totals(conn, order_id, values)
+    return {"order_id": order_id, "promo_code": promo_code, 'applied': True, **values, **credit}
 
 
 @tool_result
@@ -480,12 +501,14 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
             conn.execute("INSERT INTO store_credit_ledger(customer_id,order_id,currency,amount,kind) VALUES (?,?,?,?,'refund_credit')",(customer_id,order_id,currency,str(refund)))
             if details['target_order_id']:
                 target=conn.execute("SELECT * FROM orders WHERE order_id=? AND customer_id=? AND order_status='draft'",(details['target_order_id'],customer_id)).fetchone()
-                from mcp_server.tools.service_workflows import service_action, credit_balance, currency_for
+                from mcp_server.tools.service_workflows import service_action, available_credit, currency_for
                 if target and currency_for(conn,target['order_id'])==currency:
                     prior_allocation=conn.execute('SELECT credit_requested FROM order_service WHERE order_id=?',(target['order_id'],)).fetchone()
-                    allocated=min(refund+(money(prior_allocation[0]) if prior_allocation else money(0)),credit_balance(conn,customer_id,currency),money(target['charged_price']))
-                    if allocated>0:
+                    previous=money(prior_allocation[0]) if prior_allocation else money(0)
+                    allocated=min(refund+previous,available_credit(conn,customer_id,currency,target['order_id']),money(target['charged_price']))
+                    if allocated>0 or previous>0:
                         service_action(conn,target,'apply_store_credit','',str(allocated))
+                    if allocated>0:
                         credited_target = target['order_id']
                         target_allocation = allocated
         conn.execute("UPDATE orders SET refund_amount=?,refund_status='recorded',refund_reason=? WHERE order_id=?",

@@ -292,7 +292,8 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x
         record = context.get_conversation(cid)
         check_record(record, x_admin_key, x_cashier_key, x_customer_token)
         try:
-            cached = context.begin(cid, rid, body.message)
+            tracks_changes = getattr(app.state.engine, 'supports_request_progress', False) is True
+            cached = context.begin(cid, rid, body.message, may_have_changed=not tracks_changes)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         if cached:
@@ -316,6 +317,8 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x
             raise HTTPException(503, str(exc)) from exc
         try:
             kwargs = {'mode': record['mode']} if record['mode'] in ('admin', 'cashier') else {}
+            if tracks_changes:
+                kwargs['mutation_callback'] = lambda: context.mark_request_changed(cid, rid)
             if chart_callback is not None and record['mode'] == 'admin':
                 kwargs['chart_callback'] = chart_callback
             if record['mode'] == 'admin' and getattr(app.state.engine, 'supports_analytics_context', False):

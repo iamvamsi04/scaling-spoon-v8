@@ -250,7 +250,13 @@ def test_committed_draft_is_checkpointed_but_chat_cannot_create_account(monkeypa
         else:
             assert context.shopping_state(cid)['current_draft']['order_id'] == 'INTERRUPTED'
         assert context.shopping_state(cid)['pending_confirmation'] is None
-        assert client.post('/chat',json=body).status_code == 409
+        # The anonymous account operation was rejected before any change was
+        # possible. A committed draft remains unsafe to replay.
+        with context.connection() as conn:
+            changed = conn.execute("SELECT may_have_changed FROM messages WHERE request_id=? AND role='user'",
+                                   (body['request_id'],)).fetchone()[0]
+        assert changed == (0 if new_customer else 1)
+        assert client.post('/chat',json=body).status_code == (503 if new_customer else 409)
 
 
 def test_state_and_reply_commit_together_and_checkpoint_rejects_wrong_owner():

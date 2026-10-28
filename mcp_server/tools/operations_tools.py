@@ -149,7 +149,8 @@ def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict]
         conn.execute('DELETE FROM order_requests WHERE order_id=?', (order_id,))
         conn.executemany('INSERT INTO order_requests(order_id,item_code,quantity) VALUES (?,?,?)',
                          [(order_id, code, qty) for code, qty in quantities.items()])
-        update_totals(conn, order_id, values)
-        return {'order_id': order_id, 'status': 'draft', 'order_status': 'draft', 'estimate': values}
+        credit = update_totals(conn, order_id, values)
+        return {'order_id': order_id, 'status': 'draft', 'order_status': 'draft',
+                'estimate': values, **credit}
 
 

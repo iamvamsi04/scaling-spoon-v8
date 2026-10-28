@@ -27,7 +27,7 @@ from context.shopping_state import (ShoppingTracker, Proposal, order_snapshot,
 from database.connection import connect
 from agent.prompts.runtime_policy import runtime_policy
 from agent.coupon_policy import customer_supplied_coupon
-from agent.response_contract import ResponseContract, READ_TOOLS, result_contract, evidence_satisfied, inventory_rows
+from agent.response_contract import ResponseContract, READ_TOOLS, result_contract, evidence_satisfied, inventory_rows, category_rows
 from agent.table_presentation import tool_tables
 from context.context_manager import sanitize_analytics_context
 from context.tables import table_artifact, sanitize_tables
@@ -354,6 +354,8 @@ class RecordingWorkbench(McpWorkbench):
         self.downloads = []
         self.charts = []
         self.chart_callback = None
+        self.mutation_callback = None
+        self._change_recorded = False
         self._chart_origins = {}
         self.failed = False
         self.transport_failed = False
@@ -434,33 +436,40 @@ class RecordingWorkbench(McpWorkbench):
             # bounded separately and the full datasets remain downloadable.
             from context.reports import sanitize_reports
             report = {'title': 'Store analytics', 'datasets': data['datasets'],
-                      'coverage': data['coverage'], 'notes': data['notes']}
-            prepared = sanitize_reports([report])
-            if not prepared:
-                raise ValueError('The complete report exceeds safe attachment limits. Narrow its scope before retrying.')
-            for report in prepared:
-                if report not in self.reports:
-                    self.reports.append(report)
+                      'coverage': {**data['coverage'], 'filters': data['filters']}, 'notes': data['notes']}
+            prepared = sanitize_reports([*self.reports, report], strict=True)
+            self.reports = prepared
             if data.get('chart_mode', 'overview') in ('overview', 'none'):
                 for source in data['datasets'][:12]:
                     self.add_table(source['title'], source['columns'], source['rows'],
                                    coverage=source['scope'])
         elif name == 'execute_sql_query' and not arguments.get('chart'):
-            if self.contract.kind == 'inventory_overview':
-                rows = inventory_rows(arguments, data)
-                if rows is not None:
-                    self.add_table('Products by category',
-                        ['Category', 'Products', 'In stock products'], rows,
-                        coverage='All products, including out-of-stock products. Counts are product types, not stock units.')
-                    if self.shopping_tracker is not None:
-                        # Tables are not copied into model history. Preserve a
-                        # small, trusted navigation list for category follow-ups.
-                        state = self.shopping_tracker.state
-                        state['displayed_product_ids'] = []
-                        state['product_query'] = {'kind':'category_overview',
-                            'query':arguments.get('query'), 'parameters':[],
-                            'displayed_categories':[row[0] for row in rows[:40]],
-                            'row_count':len(rows), 'truncated':len(rows)>40}
+            rows = category_rows(data)
+            if rows is not None:
+                complete = self.contract.kind == 'inventory_overview'
+                if complete:
+                    rows = inventory_rows(arguments, data)
+                columns = ['Category', 'Products']
+                if len(data['columns']) == 3:
+                    columns.append('In stock products')
+                table = self.add_table('Products by category', columns, rows,
+                    truncated=data.get('truncated', False),
+                    coverage=('All products, including out-of-stock products.' if complete else
+                              'Returned category groups for this request; filters, limits and truncation still apply.')
+                              + ' Counts are product types, not stock units.')
+                if (table is not None and self.shopping_tracker is not None
+                        and table in sanitize_tables(self.tables)):
+                    # Tables are not copied into model history. Preserve a
+                    # small, trusted navigation list for category follow-ups.
+                    state = self.shopping_tracker.state
+                    state['displayed_product_ids'] = []
+                    state['product_query'] = {'kind':'category_overview',
+                        'query':arguments.get('query'),
+                        'parameters':deepcopy(arguments.get('parameters') or []),
+                        'displayed_categories':[row['Category'] for row in table['rows'][:40]],
+                        'row_count':len(table['rows']),
+                        'truncated':table['truncated'] or len(table['rows'])>40,
+                        'complete':complete and not table['truncated']}
             elif (not arguments.get('query','').lstrip().lower().startswith('pragma') and
                   (len(data.get('columns', [])) > 1 or len(data.get('rows', [])) != 1)):
                 counts = [row[data['columns'].index('matching_products')] for row in data['rows']] if 'matching_products' in data['columns'] else []
@@ -486,6 +495,7 @@ class RecordingWorkbench(McpWorkbench):
             return
         if table not in self.tables and len(self.tables) < 12:
             self.tables.append(table)
+        return table if table in self.tables else None
 
     def prepare_batch(self, content):
         calls = content if isinstance(content, list) else []
@@ -594,12 +604,33 @@ class RecordingWorkbench(McpWorkbench):
                 detail = 'No change was executed. This order does not belong to the selected customer.'
                 self.action_blocks.append(detail)
                 return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':detail}))])
-            if self.action_proposal and (not snapshot or snapshot['fingerprint'] != self.action_proposal.get('order_fingerprint')):
-                self.action_proposal = None
+            protected = (name == 'process_refund' and authorization.get('action') in ('approve','escalate')
+                         or name == 'manage_draft' and authorization.get('action') in ('ship','deliver'))
+            proposed = self.action_proposal if protected else None
+            if proposed and (not snapshot or proposed.get('order_id') != authorization.get('order_id')
+                    or proposed.get('action') != authorization.get('action')
+                    or snapshot['fingerprint'] != proposed.get('order_fingerprint')):
+                detail = 'No change was executed. The reviewed order or refund terms changed. Review the current terms and obtain fresh approval.'
+                self.action_blocks.append(detail)
+                return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':detail}))])
             if snapshot:
                 authorization['customer_id'] = snapshot['customer_id']
+            if proposed:
+                for key,value in proposed.get('arguments',{}).items():
+                    if authorization.get(key) is None or key == 'reason' and not authorization.get(key):
+                        authorization[key] = deepcopy(value)
             if authorization.get('action') == 'approve':
                 authorization = staff_refund_arguments(authorization, snapshot)
+            if proposed:
+                try:
+                    matched = (json.dumps(canonical_proposal_arguments(authorization),sort_keys=True)
+                               == json.dumps(canonical_proposal_arguments(proposed['arguments']),sort_keys=True))
+                except (ValueError, TypeError, KeyError):
+                    matched = False
+                if not matched:
+                    detail = 'No change was executed. The tool arguments differ from the reviewed terms. Review the revised terms before approval.'
+                    self.action_blocks.append(detail)
+                    return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':detail}))])
         if self.mode == 'customer' and customer_change(name, authorization):
             proposal = self.action_proposal
             if proposal and proposal.get('order_id'):
@@ -636,6 +667,9 @@ class RecordingWorkbench(McpWorkbench):
                      'execution_coupon_codes': list(self.coupon_codes)}
         started = perf_counter()
         try:
+            if mutating_call(name, authorization) and self.mutation_callback and not self._change_recorded:
+                self.mutation_callback()
+                self._change_recorded = True
             result = await super().call_tool(name, arguments, cancellation_token, **kwargs)
         finally:
             elapsed = perf_counter() - started
@@ -812,6 +846,7 @@ def create_model_client(**client_options):
 class BillingAgent:
     supports_analytics_context = True
     supports_action_context = True
+    supports_request_progress = True
     workbench_factory = RecordingWorkbench
 
     def __init__(self):
@@ -857,7 +892,7 @@ class BillingAgent:
         if error:
             raise ValueError(error)
 
-    async def chat(self, message, history, customer_id, mode='customer', shopping_state=None, state_callback=None, chart_callback=None, analytics_context=None, action_context=None):
+    async def chat(self, message, history, customer_id, mode='customer', shopping_state=None, state_callback=None, chart_callback=None, analytics_context=None, action_context=None, mutation_callback=None):
         started = perf_counter()
         async with self._lock:
             acquired = perf_counter()
@@ -887,6 +922,8 @@ class BillingAgent:
                 analytics_context = sanitize_analytics_context(analytics_context) if mode == 'admin' else None
                 workbench.contract = ResponseContract()
                 workbench.chart_callback = chart_callback
+                workbench.mutation_callback = mutation_callback
+                workbench._change_recorded = False
                 workbench.mode, workbench.customer_id = mode, customer_id
                 workbench.prepare_batch(None)
                 tracker = ShoppingTracker(shopping_state, customer_id, state_callback) if mode == 'customer' else None
@@ -949,8 +986,17 @@ class BillingAgent:
                         raise RuntimeError("Agent did not produce a final text answer.")
                 else:
                     content = final.content
+                staff_proposal = None
+                review = None
+                if (mode in ('admin','cashier') and not workbench.completed_changes
+                        and not (workbench.uncertain_change or workbench.completed_response_error or workbench.dispatch_problem)):
+                    review, staff_proposal = staff_confirmation(content,mode,customer_id)
                 if workbench.action_blocks:
                     content = blocked_action_reply(content, workbench, tracker is not None)
+                    if staff_proposal is not None:
+                        content += '\n\n' + review
+                elif staff_proposal is not None:
+                    content = review
                 if workbench.uncertain_change:
                     content = '\n'.join([*workbench.completed_changes,
                         'An internal tool error interrupted this request. I cannot verify whether the change completed. '
@@ -960,11 +1006,6 @@ class BillingAgent:
                         'The saved change completed, but response handling failed. Do not repeat the change.'])
                 elif workbench.dispatch_problem:
                     content = '\n'.join([*workbench.completed_changes,workbench.dispatch_problem])
-                staff_proposal = None
-                if mode in ('admin','cashier') and not workbench.completed_changes and not workbench.action_blocks:
-                    review, staff_proposal = staff_confirmation(content,mode,customer_id)
-                    if staff_proposal is not None:
-                        content = review
                 if not workbench.failed:
                     content, explanation_tables = split_reply_tables(content)
                     # Verified tool tables already carry the source rows. A
@@ -996,9 +1037,11 @@ class BillingAgent:
                          workbench.model_calls if workbench else 0,
                          workbench.input_tokens if workbench else 0,
                          workbench.output_tokens if workbench else 0)
-                if self._workbench is not None:
-                    self._workbench.shopping_tracker = None
-                    self._workbench.chart_callback = None
+                if workbench is not None:
+                    workbench.shopping_tracker = None
+                    workbench.chart_callback = None
+                    workbench.mutation_callback = None
+                    workbench._change_recorded = False
                 if not self._managed or (self._workbench is not None and self._workbench.transport_failed):
                     await self._reset()
 

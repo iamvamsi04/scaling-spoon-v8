@@ -5,7 +5,7 @@ import pytest
 from agent import response_contract as module
 from agent.response_contract import (
     INVENTORY_QUERY, ResponseContract, evidence_for, evidence_satisfied,
-    inventory_rows, report_reply, result_contract,
+    inventory_rows, category_rows, report_reply, result_contract,
 )
 
 
@@ -64,6 +64,42 @@ def test_complete_empty_inventory_is_a_verified_empty_report():
     contract = result_contract('execute_sql_query', arguments, data)
     assert contract.report and inventory_rows(arguments, data) == []
     assert 'no products' in report_reply(contract, ('execute_sql_query', arguments, data))
+
+
+def test_current_two_column_inventory_has_no_invented_stock_counts():
+    query = INVENTORY_QUERY.replace('COUNT(*) AS products, '
+        'SUM(CASE WHEN i.availablequantity>0 THEN 1 ELSE 0 END) AS in_stock_products',
+        'COUNT(DISTINCT i.item_code) AS product_count')
+    arguments = {'query': query, 'parameters': []}
+    data = {'ok': True, 'columns': ['category', 'product_count'],
+            'rows': [['Uncategorised', 2], ['monitors', 3]], 'truncated': False}
+    contract = result_contract('execute_sql_query', arguments, data)
+    assert contract.kind == 'inventory_overview'
+    assert inventory_rows(arguments, data) == [['monitors', 3], ['Uncategorised', 2]]
+    reply = report_reply(contract, ('execute_sql_query', arguments, data))
+    assert reply.startswith('The store has 5 products across 2 categories.')
+    assert 'currently in stock' not in reply
+    assert 'lists every category' in reply
+    data['columns'] = ['category', 'products', 'in_stock_products']
+    data['rows'] = [['Monitors', 3, 2]]
+    assert inventory_rows(arguments, data) is None
+
+
+@pytest.mark.parametrize('rows', [
+    [['monitors', 1], ['Uncategorised', 0], ['Monitors', 3]], [],
+])
+def test_category_navigation_shape_preserves_returned_labels_and_order_when_truncated(rows):
+    data = {'ok': True, 'columns': ['category', 'product_count'], 'rows': rows, 'truncated': True}
+    assert category_rows(data) == rows
+    assert inventory_rows({'query': INVENTORY_QUERY + ' LIMIT 2'}, data) is None
+
+
+@pytest.mark.parametrize('rows', [
+    [['Monitors', True]], [['Monitors', -1]], [['Monitors', 1.5]],
+    [['', 1]], [['Monitors', 1], ['Monitors', 2]], [['Monitors', 1, 2]],
+])
+def test_invalid_category_navigation_rows_are_not_trusted(rows):
+    assert category_rows({'ok': True, 'columns': ['category', 'product_count'], 'rows': rows}) is None
 
 
 def test_inventory_summary_preserves_singular_grammar_and_sorted_rows():

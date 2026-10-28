@@ -300,3 +300,44 @@ def test_legacy_pending_refund_without_details_uses_original_method():
     assert proposal['arguments']['amount'] == '20.00'
     assert proposal['arguments']['disposition'] == 'original_method'
     assert '20.00' in visible
+
+
+def test_changed_staff_refund_terms_need_fresh_review_even_with_omitted_arguments(monkeypatch):
+    order('AUTH-STALE-STAFF',placed=True)
+    request_refund('AUTH-STALE-STAFF','20.00')
+    _, reviewed = module.staff_confirmation(staff_review('AUTH-STALE-STAFF'))
+    with transaction() as conn:
+        conn.execute('UPDATE refund_requests SET amount=30 WHERE order_id=?',('AUTH-STALE-STAFF',))
+    script = [call('process_refund',order_id='AUTH-STALE-STAFF',action='approve'),
+              staff_review('AUTH-STALE-STAFF',amount='30.00'),
+              call('process_refund',order_id='AUTH-STALE-STAFF',action='approve'),
+              'The reviewed 30 USD refund is recorded.']
+    async def run():
+        async with running_engine(monkeypatch,script) as (engine,_):
+            blocked = await engine.chat('Those terms are approved.',[],None,mode='cashier',action_context=reviewed)
+            assert engine._workbench.tool_calls == 0
+            assert 'terms changed' in blocked['response']
+            assert blocked['pending_staff_action']['arguments']['amount'] == '30.00'
+            assert scalar("SELECT status FROM refund_requests WHERE order_id='AUTH-STALE-STAFF'") == 'pending'
+            accepted = await engine.chat('The updated amount is fine.',[],None,mode='cashier',
+                                         action_context=blocked['pending_staff_action'])
+            assert engine._workbench.tool_calls == 1
+            assert accepted['pending_staff_action'] is None
+    asyncio.run(run())
+    assert scalar("SELECT refund_amount FROM orders WHERE order_id='AUTH-STALE-STAFF'") == 30
+
+
+def test_matching_staff_proposal_cannot_change_reviewed_receipt_or_waiver(monkeypatch):
+    order('AUTH-STAFF-ARGUMENTS',placed=True)
+    request_refund('AUTH-STAFF-ARGUMENTS','20.00')
+    _, reviewed = module.staff_confirmation(staff_review('AUTH-STAFF-ARGUMENTS'))
+    script = [call('process_refund',order_id='AUTH-STAFF-ARGUMENTS',action='approve',
+                   return_received=False,waiver_reason='A different assessment'),
+              'The refund was approved.']
+    async def run():
+        async with running_engine(monkeypatch,script) as (engine,_):
+            blocked = await engine.chat('Approve the reviewed terms.',[],None,mode='admin',action_context=reviewed)
+            assert engine._workbench.tool_calls == 0
+            assert 'arguments differ' in blocked['response']
+    asyncio.run(run())
+    assert scalar("SELECT status FROM refund_requests WHERE order_id='AUTH-STAFF-ARGUMENTS'") == 'pending'

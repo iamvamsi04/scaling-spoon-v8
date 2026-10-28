@@ -37,6 +37,7 @@ def initialize():
             conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
             request_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'done', response_json TEXT,
+            may_have_changed INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(conversation_id,request_id,role));
         CREATE INDEX IF NOT EXISTS ix_messages_conversation ON messages(conversation_id,id);
@@ -49,6 +50,10 @@ def initialize():
         if 'mode' not in columns:
             # Older transcripts may contain store-wide data; require admin to resume them.
             conn.execute("ALTER TABLE conversations ADD COLUMN mode TEXT NOT NULL DEFAULT 'admin'")
+        columns = {r['name'] for r in conn.execute('PRAGMA table_info(messages)')}
+        if 'may_have_changed' not in columns:
+            # Existing failures have no dispatch evidence and cannot be replayed.
+            conn.execute("ALTER TABLE messages ADD COLUMN may_have_changed INTEGER NOT NULL DEFAULT 1")
 
 
 def conversation(conversation_id=None, customer_id=None, mode='customer'):
@@ -274,19 +279,37 @@ def completed_response(conversation_id, request_id, message):
     return None
 
 
-def begin(conversation_id, request_id, message):
+def begin(conversation_id, request_id, message, may_have_changed=True):
     with connection() as conn:
+        conn.execute('BEGIN IMMEDIATE')
         row = conn.execute("SELECT * FROM messages WHERE conversation_id=? AND request_id=? AND role='user'",
                            (conversation_id, request_id)).fetchone()
         if row:
             if row["content"] != message:
                 raise ValueError("Request ID was already used with different content.")
-            if row["response_json"]:
+            if row['status'] == 'done' and row["response_json"]:
                 return json.loads(row["response_json"])
+            newer = conn.execute("SELECT 1 FROM messages WHERE conversation_id=? AND role='user' AND id>? LIMIT 1",
+                                 (conversation_id, row['id'])).fetchone()
+            if row['status'] == 'failed' and row['may_have_changed'] == 0 and not newer:
+                conn.execute("UPDATE messages SET status='pending',may_have_changed=? WHERE id=?",
+                             (int(bool(may_have_changed)), row['id']))
+                return None
             raise ValueError("This turn is pending or failed. Check order state before sending a new mutation.")
-        conn.execute("INSERT INTO messages(conversation_id,request_id,role,content,status) VALUES (?,?,'user',?,'pending')",
-                     (conversation_id, request_id, message))
+        conn.execute("INSERT INTO messages(conversation_id,request_id,role,content,status,may_have_changed) "
+                     "VALUES (?,?,'user',?,'pending',?)",
+                     (conversation_id, request_id, message, int(bool(may_have_changed))))
         return None
+
+
+def mark_request_changed(conversation_id, request_id):
+    """Persist uncertainty before dispatching a change, never after its result."""
+    with connection() as conn:
+        changed = conn.execute("UPDATE messages SET may_have_changed=1 WHERE conversation_id=? "
+                               "AND request_id=? AND role='user' AND status='pending'",
+                               (conversation_id, request_id))
+        if changed.rowcount != 1:
+            raise ValueError('The billing change does not match an active request.')
 
 
 def finish(conversation_id, request_id, response):

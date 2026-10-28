@@ -53,6 +53,37 @@ def provision(client, customer='CUST001', password=PASSWORD):
     return {'X-Customer-Token': result['token']}
 
 
+def test_former_account_default_cannot_sign_in_or_be_chosen(client):
+    from api import customer_auth
+    legacy = 'CUST001-Store!2026'
+    with closing(connect()) as conn:
+        conn.execute('INSERT INTO customer_credentials(customer_id,password_hash) VALUES (?,?)',
+                     ('CUST001', customer_auth.password_hash(legacy)))
+        conn.commit()
+    result = client.post('/customers/login', json={'customer_id': 'CUST001', 'password': legacy})
+    assert result.status_code == 401
+    with pytest.raises(ValueError, match='former account default'):
+        customer_auth.set_password('CUST001', legacy)
+    with pytest.raises(ValueError, match='former account default'):
+        customer_auth.register('NEW-ACCOUNT', 'New account', 'NEW-ACCOUNT-Store!2026')
+    with closing(connect(readonly=True)) as conn:
+        assert not conn.execute("SELECT 1 FROM customers WHERE customer_id='NEW-ACCOUNT'").fetchone()
+        assert conn.execute('SELECT COUNT(*) FROM customer_sessions').fetchone()[0] == 0
+    customer_auth.set_password('CUST001', PASSWORD)
+    assert client.post('/customers/login', json={'customer_id': 'CUST001', 'password': PASSWORD}).status_code == 200
+
+
+def test_customer_passwords_support_unicode_without_legacy_comparison_errors(client):
+    from api import customer_auth
+    password = 'A secure password café 東京 2026'
+    customer_auth.set_password('CUST001', password)
+    result = client.post('/customers/login', json={'customer_id': 'CUST001', 'password': password})
+    assert result.status_code == 200
+    assert customer_auth.customer_for_token(result.json()['token']) == 'CUST001'
+    registered = customer_auth.register('UNICODE', 'Customer', password)
+    assert customer_auth.customer_for_token(registered['token']) == 'UNICODE'
+
+
 def conversation(client, headers, customer='CUST001'):
     response = client.post('/conversations', json={'customer_id': customer}, headers=headers)
     assert response.status_code == 200, response.text

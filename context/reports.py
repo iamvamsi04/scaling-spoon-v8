@@ -1,7 +1,9 @@
 """Validated complete report datasets for downloads, outside model history."""
 
 import csv
+import hashlib
 import io
+import json
 import re
 from collections.abc import Mapping
 
@@ -90,15 +92,42 @@ def report_artifact(title, datasets, *, coverage=None, notes=None):
     return result
 
 
-def sanitize_reports(reports):
-    if not isinstance(reports, (list, tuple)) or not reports or not isinstance(reports[0], Mapping):
+def sanitize_reports(reports, *, strict=False):
+    """Preserve distinct complete artifacts within one shared download budget.
+
+    Trusted assembly uses strict mode to report attachment failures to the model.
+    Saved/untrusted collections may skip malformed entries, but an oversized
+    collection is rejected as a whole rather than silently losing valid reports.
+    """
+    if not isinstance(reports, (list, tuple)):
+        if strict:
+            raise ValueError('Invalid report attachments.')
         return []
-    report = reports[0]
-    try:
-        return [report_artifact(report.get('title'), report.get('datasets'),
-                                coverage=report.get('coverage'), notes=report.get('notes'))]
-    except (TypeError, ValueError, OverflowError):
-        return []
+    result, seen, size = [], set(), 2
+    for report in reports:
+        try:
+            if not isinstance(report, Mapping):
+                raise ValueError('Invalid report attachment.')
+            prepared = report_artifact(report.get('title'), report.get('datasets'),
+                                       coverage=report.get('coverage'), notes=report.get('notes'))
+        except (TypeError, ValueError, OverflowError):
+            if strict:
+                raise
+            continue
+        encoded = json.dumps(prepared, ensure_ascii=False, allow_nan=False,
+                             sort_keys=True, separators=(',', ':')).encode('utf-8')
+        identity = hashlib.sha256(encoded).digest()
+        if identity in seen:
+            continue
+        size += len(encoded) + bool(result)
+        if size > MAX_REPORT_BYTES:
+            if strict:
+                raise ValueError('The combined report attachments exceed the download size limit. '
+                                 'Narrow the report scopes before retrying.')
+            return []
+        result.append(prepared)
+        seen.add(identity)
+    return result
 
 
 def csv_bytes(dataset):

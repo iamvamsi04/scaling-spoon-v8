@@ -9,12 +9,27 @@ from mcp_server.tools.billing_tools import BillingError, money, order_row, is_pl
 
 
 def currency_for(conn, oid):
-    row=conn.execute("SELECT COALESCE(NULLIF(TRIM(d.currency),''),(SELECT value FROM billing_config WHERE key='currency'),'USD') FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id WHERE o.order_id=?",(oid,)).fetchone()
+    row=conn.execute("SELECT COALESCE(NULLIF(TRIM(d.currency),''),(SELECT NULLIF(TRIM(value),'') FROM billing_config WHERE key='currency'),'USD') FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id WHERE o.order_id=?",(oid,)).fetchone()
     return row[0].strip().upper()
 
 
 def credit_balance(conn, customer, currency):
-    return sum((Decimal(str(r[0])) for r in conn.execute('SELECT amount FROM store_credit_ledger WHERE customer_id=? AND currency=?',(customer,currency))),Decimal(0))
+    return sum((Decimal(str(r[0])) for r in conn.execute('SELECT amount FROM store_credit_ledger WHERE customer_id=? AND UPPER(TRIM(currency))=?',(customer,currency.strip().upper()))),Decimal(0))
+
+
+def available_credit(conn, customer, currency, exclude_order_id=None):
+    """Ledger balance less this customer's other active draft allocations."""
+    currency = currency.strip().upper()
+    rows = conn.execute('''SELECT s.credit_requested FROM orders o
+        JOIN order_service s ON s.order_id=o.order_id
+        LEFT JOIN order_details d ON d.order_id=o.order_id
+        WHERE o.customer_id=? AND o.order_status='draft'
+          AND (? IS NULL OR o.order_id<>?)
+          AND UPPER(COALESCE(NULLIF(TRIM(d.currency),''),
+              (SELECT NULLIF(TRIM(value),'') FROM billing_config WHERE key='currency'),'USD'))=?''',
+        (customer, exclude_order_id, exclude_order_id, currency))
+    reserved = sum((max(Decimal(0), Decimal(str(row[0]))) for row in rows), Decimal(0))
+    return max(Decimal(0), credit_balance(conn, customer, currency) - reserved)
 
 
 def check_target(conn, target, customer):
@@ -129,10 +144,10 @@ def service_action(conn,order,action,reason,credit_amount):
     if is_placed(conn,order): raise BillingError('Store credit can only be applied to an active draft.')
     amount=money(credit_amount) if credit_amount is not None else None
     if amount is None or amount>money(order['charged_price']): raise BillingError('Credit amount must be nonnegative and no greater than the draft total; use zero to clear it.')
-    if amount>credit_balance(conn,order['customer_id'],currency): raise BillingError('Insufficient store credit in this currency.')
+    if amount>available_credit(conn,order['customer_id'],currency,oid): raise BillingError('Insufficient unreserved store credit in this currency. Reduce another draft allocation first.')
     conn.execute('INSERT INTO order_service(order_id,credit_requested) VALUES (?,?) ON CONFLICT(order_id) DO UPDATE SET credit_requested=excluded.credit_requested',(oid,str(amount)))
     return {'order_id':oid,'order_status':'draft','currency':currency,'credit_requested':str(amount), 'remaining_invoice_amount':str(money(order['charged_price'])-amount),
-            'note':'Credit allocation saved on draft; available balance is rechecked and redeemed once at placement.'}
+            'note':'Credit reserved on this draft; unreserved balance is rechecked and redeemed once at placement.'}
 
 
 def redeem_credit(conn,order):
@@ -140,7 +155,7 @@ def redeem_credit(conn,order):
     amount=money(row[0]) if row else Decimal(0)
     if amount:
         currency=currency_for(conn,order['order_id'])
-        if amount>money(order['charged_price']) or amount>credit_balance(conn,order['customer_id'],currency): raise BillingError('Requested store credit exceeds the current draft total or available credit. Refresh the allocation.')
+        if amount>money(order['charged_price']) or amount>available_credit(conn,order['customer_id'],currency,order['order_id']): raise BillingError('Requested store credit exceeds the current draft total or unreserved credit. Refresh the allocation.')
         conn.execute("INSERT INTO store_credit_ledger(customer_id,order_id,currency,amount,kind) VALUES (?,?,?,?,'order_redemption')",(order['customer_id'],order['order_id'],currency,str(-amount)))
     return amount
 
