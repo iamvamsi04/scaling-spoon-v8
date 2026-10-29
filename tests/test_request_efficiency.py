@@ -1,5 +1,4 @@
 """Skip unused report blobs and serve authorized completed retries without queueing."""
-from address_support import prepare_delivery
 import asyncio
 from contextlib import contextmanager
 from copy import deepcopy
@@ -179,7 +178,6 @@ def owned_pending_conversation(client):
     cid = created.json()['conversation_id']
     draft = request_order('CUST001', [{'item_code':'ITEM001','quantity':1}], 'EFF-PENDING')
     assert draft['ok'], draft
-    prepare_delivery(draft['order_id'], 'CUST001')
     tracker = ShoppingTracker(None, 'CUST001')
     summary = 'Place draft EFF-PENDING for one keyboard, total USD 79.90?'
     reply = tracker.finish(json.dumps({'reply':summary, 'shopping_update':{
@@ -302,7 +300,6 @@ def test_cached_customer_retry_does_not_expire_or_replace_a_newer_pending_propos
         cid, rid, message, saved = owned_pending_conversation(client)
         next_draft = request_order('CUST001', [{'item_code':'ITEM002','quantity':1}], 'EFF-CURRENT')
         assert next_draft['ok'], next_draft
-        prepare_delivery(next_draft['order_id'], 'CUST001')
         tracker = ShoppingTracker(saved['shopping_state'], 'CUST001')
         summary = 'Place the new owned draft EFF-CURRENT, total USD 29.50?'
         reply = tracker.finish(json.dumps({'reply':summary,'shopping_update':{

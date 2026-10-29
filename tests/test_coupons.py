@@ -1,4 +1,3 @@
-from address_support import place_order_with_address, prepare_delivery
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
@@ -9,9 +8,7 @@ from mcp_server.tools.billing_tools import request_order, apply_promotion, place
 
 
 def draft():
-    oid = request_order('CUST001',[{'item_code':'ITEM001','quantity':2}])['order_id']
-    prepare_delivery(oid, 'CUST001')
-    return oid
+    return request_order('CUST001',[{'item_code':'ITEM001','quantity':2}])['order_id']
 
 
 def expiry(offset):
@@ -41,14 +38,14 @@ def test_second_coupon_rejected_and_same_code_never_stacks():
     with closing(connect()) as conn:
         row=conn.execute('SELECT * FROM orders WHERE order_id=?',(oid,)).fetchone()
         assert row['promo_code']=='SAVE10' and row['discount_applied']==15.98
-    assert place_order_with_address(oid,'CUST001')['ok']
+    assert place_order(oid,'CUST001')['ok']
 
 
 def test_checkout_rechecks_expiry_without_partial_fulfillment():
     oid=draft()
     assert apply_promotion(oid,'CUST001','SAVE10')['ok']
     expiry('-1 day')
-    result=place_order_with_address(oid,'CUST001')
+    result=place_order(oid,'CUST001')
     assert not result['ok'] and 'expired' in result['error']
     with closing(connect()) as conn:
         assert conn.execute('SELECT COUNT(*) FROM invoice_lines').fetchone()[0]==0
@@ -60,9 +57,9 @@ def test_checkout_rechecks_expiry_without_partial_fulfillment():
 def test_expiry_does_not_rewrite_existing_invoices():
     oid=draft()
     assert apply_promotion(oid,'CUST001','SAVE10')['ok']
-    placed=place_order_with_address(oid,'CUST001')
+    placed=place_order(oid,'CUST001')
     expiry('-1 day')
-    assert place_order_with_address(oid,'CUST001')['invoice_number']==placed['invoice_number']
+    assert place_order(oid,'CUST001')['invoice_number']==placed['invoice_number']
     with closing(connect()) as conn:
         assert conn.execute('SELECT charged_price FROM orders WHERE order_id=?',(oid,)).fetchone()[0]==143.82
 

@@ -3,7 +3,6 @@
 Only Azure model responses are replayed; queries, analytics, PDF generation and
 presentation artifacts execute against the isolated application databases.
 """
-from address_support import place_order_with_address, prepare_delivery
 import asyncio
 from contextlib import asynccontextmanager, closing
 import json
@@ -65,7 +64,7 @@ def issued_orders(product_categories):
     for oid, customer, code, quantity in [('FIRST', 'CUST001', 'ITEM001', 2), ('SECOND', 'CUST002', 'ITEM002', 1)]:
         draft = request_order(customer, [{'item_code': code, 'quantity': quantity}], order_id=oid)
         assert draft['ok'], draft
-        placed = place_order_with_address(oid, customer)
+        placed = place_order(oid, customer)
         assert placed['ok'], placed
         invoices.append((customer, placed['invoice_number']))
     return invoices

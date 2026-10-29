@@ -1,4 +1,3 @@
-from address_support import place_order_with_address, prepare_delivery
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +20,7 @@ CASHIER = 'test-cashier-secret-123456789'
 def order():
     result = request_order('CUST001', [{'item_code':'ITEM001','quantity':2}])
     assert result['ok']
-    assert place_order_with_address(result['order_id'], 'CUST001')['ok']
+    assert place_order(result['order_id'], 'CUST001')['ok']
     return result['order_id']
 
 

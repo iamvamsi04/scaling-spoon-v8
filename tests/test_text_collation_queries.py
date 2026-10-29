@@ -1,5 +1,4 @@
 """Database comparisons ignore label casing without weakening account boundaries."""
-from address_support import place_order_with_address, prepare_delivery
 from contextlib import closing
 import sqlite3
 
@@ -37,7 +36,7 @@ def labelled_records():
                                ('Case-Order-02', 'CUST001')]:
         draft = request_order(customer, [{'item_code': 'ITEM001', 'quantity': 1}], order_id)
         assert draft['ok'], draft
-        assert place_order_with_address(order_id, customer)['ok']
+        assert place_order(order_id, customer)['ok']
         requested = refund(order_id, customer, 'Return', '5.00',
                            execution_customer_id=customer)
         assert requested['ok'], requested

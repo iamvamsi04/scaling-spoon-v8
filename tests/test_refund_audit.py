@@ -1,5 +1,4 @@
 """Refund authorization, immutable request terms, and financial regression checks."""
-from address_support import place_order_with_address, prepare_delivery
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import pytest
@@ -14,9 +13,8 @@ refund = scoped_tool(process_refund)
 def order(items=None, *, placed=True):
     result = request_order('CUST001', items or [{'item_code': 'ITEM001', 'quantity': 2}])
     assert result['ok'], result
-    prepare_delivery(result['order_id'], 'CUST001')
     if placed:
-        assert place_order_with_address(result['order_id'], 'CUST001')['ok']
+        assert place_order(result['order_id'], 'CUST001')['ok']
     return result['order_id']
 
 
@@ -159,7 +157,7 @@ def test_pending_amount_cannot_override_nonrefundable_shipping():
 def test_closed_target_cart_is_not_reported_as_credited():
     oid, target = order(), order(placed=False)
     assert request(oid, amount='10', disposition='store_credit', target_order_id=target)['ok']
-    assert place_order_with_address(target, 'CUST001')['ok']
+    assert place_order(target, 'CUST001')['ok']
     result = approve(oid, return_received=True)
     assert result['ok'] and result['disposition'] == 'store_credit'
     assert result['credit_target_order_id'] is None

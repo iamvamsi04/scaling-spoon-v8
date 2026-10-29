@@ -1,5 +1,4 @@
 """Regression checks for service migrations and invoice-level reporting."""
-from address_support import place_order_with_address, prepare_delivery
 from contextlib import closing
 from decimal import Decimal
 import sqlite3
@@ -13,7 +12,7 @@ from mcp_server.tools.analytics_tools import billing_analysis
 def placed():
     order = request_order('CUST001', [{'item_code': 'ITEM001', 'quantity': 1}])
     assert order['ok']
-    assert place_order_with_address(order['order_id'], 'CUST001')['ok']
+    assert place_order(order['order_id'], 'CUST001')['ok']
     return order['order_id']
 
 

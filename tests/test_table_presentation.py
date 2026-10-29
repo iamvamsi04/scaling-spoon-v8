@@ -1,5 +1,4 @@
 """Native tables retain verified facts and model-selected presentation."""
-from address_support import place_order_with_address, prepare_delivery
 from copy import deepcopy
 import json
 
@@ -33,7 +32,7 @@ def valid(tables):
 def order():
     draft = request_order('CUST001', [{'item_code': 'ITEM001', 'quantity': 2}], 'TABLE-ORDER')
     assert draft['ok'], draft
-    placed = place_order_with_address('TABLE-ORDER', 'CUST001')
+    placed = place_order('TABLE-ORDER', 'CUST001')
     assert placed['ok'], placed
     return placed
 

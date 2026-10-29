@@ -1,4 +1,3 @@
-from address_support import place_order_with_address, prepare_delivery
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 import pytest
@@ -15,7 +14,6 @@ process_refund = partial(scoped_tool(process_refund), action='approve', confirme
 def draft(items=None, order_id=None):
     result = request_order("CUST001", items or [{"item_code": "ITEM001", "quantity": 2}], order_id)
     assert result["ok"], result
-    prepare_delivery(result["order_id"], "CUST001")
     return result["order_id"]
 
 
@@ -63,16 +61,16 @@ def test_order_lifecycle_and_retries():
     assert scalar("SELECT availablequantity FROM items WHERE item_code='ITEM001'") == 40
     assert request_order("CUST001", [{"item_code": "ITEM001", "quantity": 2}], oid)["already_exists"]
     assert not request_order("CUST001", [{"item_code": "ITEM001", "quantity": 3}], oid)["ok"]
-    placed = place_order_with_address(oid, "CUST001")
+    placed = place_order(oid, "CUST001")
     assert placed["ok"] and placed["charged_price"] == "159.80"
-    assert place_order_with_address(oid, "CUST001")["already_placed"]
+    assert place_order(oid, "CUST001")["already_placed"]
     assert scalar("SELECT availablequantity FROM items WHERE item_code='ITEM001'") == 38
     assert scalar("SELECT COUNT(*) FROM invoice_lines") == 1
 
 
 def test_duplicate_items_combined():
     oid = draft([{"item_code": "ITEM001", "quantity": 2}, {"item_code": "ITEM001", "quantity": 3}])
-    assert place_order_with_address(oid, "CUST001")["charged_price"] == "399.50"
+    assert place_order(oid, "CUST001")["charged_price"] == "399.50"
     assert scalar("SELECT qty_billed FROM invoice_lines") == 5
 
 
@@ -80,7 +78,7 @@ def test_transaction_rolls_back_all_lines():
     oid = draft([{"item_code": "ITEM001", "quantity": 2}, {"item_code": "ITEM002", "quantity": 2}])
     with transaction() as conn:
         conn.execute("UPDATE items SET availablequantity=0 WHERE item_code='ITEM002'")
-    assert not place_order_with_address(oid, "CUST001")["ok"]
+    assert not place_order(oid, "CUST001")["ok"]
     assert scalar("SELECT availablequantity FROM items WHERE item_code='ITEM001'") == 40
     assert scalar("SELECT COUNT(*) FROM invoice_lines") == 0
     assert scalar("SELECT COUNT(*) FROM order_fulfilled") == 0
@@ -90,7 +88,7 @@ def test_concurrent_placement_cannot_oversell():
     one = draft([{"item_code": "ITEM003", "quantity": 10}])
     two = draft([{"item_code": "ITEM003", "quantity": 10}])
     with ThreadPoolExecutor(2) as pool:
-        results = list(pool.map(lambda oid: place_order_with_address(oid, "CUST001"), [one, two]))
+        results = list(pool.map(lambda oid: place_order(oid, "CUST001"), [one, two]))
     assert sum(r["ok"] for r in results) == 1
     assert scalar("SELECT availablequantity FROM items WHERE item_code='ITEM003'") == 5
 
@@ -105,7 +103,7 @@ def test_promotion_tax_shipping_and_lock():
     assert promo["discount_applied"] == "15.98"
     assert promo["tax_amount"] == "10.79" and promo["charged_price"] == "159.61"
     assert apply_promotion(oid, "CUST001", "SAVE10")["charged_price"] == "159.61"
-    assert place_order_with_address(oid, "CUST001")["charged_price"] == "159.61"
+    assert place_order(oid, "CUST001")["charged_price"] == "159.61"
     assert not apply_promotion(oid, "CUST001", "SAVE500")["ok"]
 
 
@@ -118,7 +116,7 @@ def test_historical_price_and_overlap():
     with transaction() as conn:
         conn.execute("INSERT INTO price_history(item_code,unit_price,effective_from) VALUES ('ITEM001',50,'2020-01-01')")
     oid = draft()
-    assert place_order_with_address(oid, "CUST001")["charged_price"] == "100.00"
+    assert place_order(oid, "CUST001")["charged_price"] == "100.00"
     with transaction() as conn:
         conn.execute("INSERT INTO price_history(item_code,unit_price,effective_from) VALUES ('ITEM001',60,'2021-01-01')")
     assert not request_order("CUST001", [{"item_code": "ITEM001", "quantity": 1}])["ok"]
@@ -127,15 +125,15 @@ def test_historical_price_and_overlap():
 @pytest.mark.parametrize("amount", ["0", "-1", "99999", "NaN", "Infinity"])
 def test_invalid_refund(amount):
     oid = draft()
-    place_order_with_address(oid, "CUST001")
+    place_order(oid, "CUST001")
     assert not request_refund(oid, "CUST001", "Returned", amount)["ok"]
 
 
 def test_refund_and_pdf_owner():
     oid = draft()
     assert not process_refund(oid, "CUST001", "Return")["ok"]
-    assert not place_order_with_address(oid, "CUST002")["ok"]
-    invoice = place_order_with_address(oid, "CUST001")["invoice_number"]
+    assert not place_order(oid, "CUST002")["ok"]
+    invoice = place_order(oid, "CUST001")["invoice_number"]
     assert not process_refund(oid, "CUST002", "Return")["ok"]
     assert request_refund(oid, "CUST001", "Return", "10.00")["ok"]
     refund = process_refund(oid, "CUST001", "Return", "10.00")
@@ -155,7 +153,7 @@ def test_invoice_reports_refunds_without_inventing_payment_balance(monkeypatch):
         return original(value, *args, **kwargs)
     monkeypatch.setattr(pdf,'Paragraph',capture)
     draft = request_order('CUST001',[{'item_code':'ITEM001','quantity':1}])
-    invoice = place_order_with_address(draft['order_id'],'CUST001')['invoice_number']
+    invoice = place_order(draft['order_id'],'CUST001')['invoice_number']
     assert request_refund(draft['order_id'],'CUST001','Return','10.00')['ok']
     assert process_refund(draft['order_id'],'CUST001','Return','10.00')['ok']
     assert download_invoice(invoice,'CUST001')['ready']

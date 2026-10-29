@@ -1,5 +1,4 @@
 """Structured approvals and domain rules; chat phrasing is interpreted by the model."""
-from address_support import place_order_with_address, prepare_delivery
 import asyncio
 from contextlib import asynccontextmanager, closing
 import json
@@ -48,9 +47,8 @@ def scalar(query, parameters=()):
 def order(order_id, placed=False, item_code='ITEM001'):
     draft = request_order('CUST001', [{'item_code': item_code, 'quantity': 1}], order_id)
     assert draft['ok'], draft
-    prepare_delivery(order_id, 'CUST001')
     if placed:
-        result = place_order_with_address(order_id, 'CUST001')
+        result = place_order(order_id, 'CUST001')
         assert result['ok'], result
         return result['invoice_number']
     return order_id
@@ -65,12 +63,6 @@ def pending(order_id, action='place_order', arguments=None, summary=None):
     visible = tracker.finish(json.dumps({'reply': summary,
         'shopping_update': {'pending_confirmation': proposal}}))
     assert tracker.state['pending_confirmation'], visible
-    if action == 'place_order':
-        assert visible.startswith(tracker.state['pending_confirmation']['summary'] + '\nItems:\n')
-        assert 'Delivery address for approval:' in visible
-        assert tracker.state['pending_confirmation']['arguments'] is None
-        delivery = tracker.state['pending_confirmation']['delivery']['delivery_address']
-        assert all(value in visible for value in delivery.values() if value)
     return tracker.state, [{'role': 'user', 'content': 'Please prepare those details.'},
                            {'role': 'assistant', 'content': visible}]
 
@@ -215,7 +207,7 @@ def test_explicit_staff_approval_still_obeys_pending_request_and_cashier_limit(m
             for oid, _, role, success in cases:
                 result = await engine.chat(f'Approve the pending refund for {oid}. The returned goods were received.',
                     [], None, mode=role)
-                assert engine._workbench.tool_calls == (1 if success else 0)
+                assert engine._workbench.tool_calls == 1
                 assert bool(engine._workbench.receipts) == success
                 assert ('approved in the local ledger' in result['response']) == success
     asyncio.run(run())

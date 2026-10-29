@@ -1,4 +1,3 @@
-from address_support import place_order_with_address, prepare_delivery
 import json
 import sqlite3
 import pytest
@@ -39,7 +38,7 @@ def test_generic_attributes_relations_and_current_prices():
 def test_direct_invoice_queries_and_refunds_remain_scoped():
     from mcp_server.tools.billing_tools import process_refund
     order = request_order('CUST001',[{'item_code':'ITEM001','quantity':2}],'ONE')
-    assert place_order_with_address(order['order_id'],'CUST001')['ok']
+    assert place_order(order['order_id'],'CUST001')['ok']
     assert scoped_tool(process_refund)('ONE','CUST001','Partial return','10.00',execution_customer_id='CUST001')['ok']
     assert scoped_tool(process_refund)('ONE','CUST001','Partial return','10.00', action='approve', confirmed=True, return_received=True, execution_mode='admin')['ok']
     query = """SELECT o.charged_price,COALESCE(o.refund_amount,0),
@@ -54,7 +53,7 @@ def test_direct_invoice_queries_and_refunds_remain_scoped():
     assert not read('SELECT * FROM payments')['ok']
     assert not read('SELECT * FROM credit_notes')['ok']
     audit = read("SELECT action FROM billing_audit ORDER BY id")
-    assert audit['rows'] == [['request_order'],['save_address'],['select_order_address'],['place_order'],['process_refund'],['process_refund']]
+    assert audit['rows'] == [['request_order'],['place_order'],['process_refund'],['process_refund']]
     assert not customer('SELECT * FROM billing_audit',execution_customer_id='CUST001')['ok']
 
 

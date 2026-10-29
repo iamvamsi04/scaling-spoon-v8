@@ -1,5 +1,4 @@
 """Adversarial service cases: no fabricated eligibility, hidden writes or cross-owner data."""
-from address_support import place_order_with_address, prepare_delivery
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -20,9 +19,8 @@ def scalar(sql, args=()):
 def order(customer='CUST001', placed=True):
     result = request_order(customer, [{'item_code': 'ITEM001', 'quantity': 1}])
     assert result['ok'], result
-    prepare_delivery(result['order_id'], customer)
     if placed:
-        result = place_order_with_address(result['order_id'], customer)
+        result = place_order(result['order_id'], customer)
         assert result['ok'], result
     return result['order_id']
 
@@ -137,7 +135,7 @@ def test_credit_allocation_can_be_cleared_without_spending_credit():
     target = order(placed=False)
     assert manage_draft(target, 'CUST001', 'apply_store_credit', credit_amount='79.90', confirmed=True)['ok']
     assert manage_draft(target, 'CUST001', 'apply_store_credit', credit_amount='0', confirmed=True)['ok']
-    result = place_order_with_address(target, 'CUST001')
+    result = place_order(target, 'CUST001')
     assert result['ok'] and result['store_credit_applied'] == '0.00'
     assert Decimal(str(scalar('SELECT SUM(amount) FROM store_credit_ledger'))) == Decimal('79.90')
 
