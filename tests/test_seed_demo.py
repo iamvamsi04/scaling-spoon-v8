@@ -103,7 +103,10 @@ def test_existing_large_dataset_gets_missing_passwords_without_resets(monkeypatc
     result = seed.generate(settings.BILLING_DB,42,date.today())
     assert result['status']=='already_seeded' and result['customer_passwords_added']==1
     after = snapshot(settings.BILLING_DB)
-    assert all(after[table]==rows for table,rows in existing.items() if table!='customer_credentials')
+    assert all(after[table]==rows for table,rows in existing.items()
+               if table not in ('customer_credentials','customer_addresses'))
+    assert set(existing['customer_addresses']) <= set(after['customer_addresses'])
+    assert len(after['customer_addresses']) == 4  # Two saved choices for each generated customer.
     assert set(existing['customer_credentials']) <= set(after['customer_credentials'])
     assert login('FAKE-CUST-0001','FAKE-CUST-0001-Store!2026')
     set_password('FAKE-CUST-0001','A separately chosen account password')
@@ -281,7 +284,12 @@ def test_all_twelve_tools_with_generated_database(tmp_path,monkeypatch):
                 execution_mode='customer',execution_customer_id=None)))
             assert not account['ok']  # Account creation belongs to verified registration.
             await invoke('manage_customer',customer_id='STORE-CUST-0001',name='Updated Demo Shopper',action='update',confirmed=True)
+            from address_support import ADDRESS_FIELDS
+            address = await invoke('manage_customer',customer_id='STORE-CUST-0001',action='add_address',
+                                   address=ADDRESS_FIELDS,confirmed=True)
             draft = await invoke('request_order',customer_id='STORE-CUST-0001',order_id='TOOL-DEMO-NEW',items=[{'item_code':'STORE-ITEM-0001','quantity':1}])
+            await invoke('manage_draft',customer_id='STORE-CUST-0001',order_id=draft['order_id'],action='select_address',
+                         address_id=address['address_id'],confirmed=True)
             await invoke('manage_draft',customer_id='STORE-CUST-0001',order_id=draft['order_id'],action='replace_items',
                          items=[{'item_code':'STORE-ITEM-0001','quantity':2}],confirmed=True)
             await invoke('apply_promotion',customer_id='STORE-CUST-0001',order_id=draft['order_id'],promo_code=scenario['promo_code'],execution_coupon_codes=[scenario['promo_code']])

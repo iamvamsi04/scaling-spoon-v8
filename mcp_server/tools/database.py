@@ -13,6 +13,7 @@ TABLES = {'billing_config', 'customers', 'items', 'promotions', 'orders',
           'order_requests', 'order_fulfilled', 'invoice_lines', 'price_history',
           'order_details', 'billing_audit', 'refund_requests', 'refund_details', 'order_service',
           'customer_billing_details','invoice_revisions','store_credit_ledger',
+          'customer_addresses','order_delivery',
           'product_details', 'product_attributes', 'product_relations', 'json_each'}
 FUNCTIONS = set('abs avg coalesce count date datetime glob group_concat hex ifnull '
                 'instr julianday length like lower ltrim max min nullif printf replace '
@@ -75,6 +76,8 @@ def schema_hint(mode='customer'):
         tables = sorted(TABLES - {'json_each'} - ({'billing_audit'} if mode != 'admin' else set()))
         if mode == 'customer':
             tables = [table for table in tables if table != 'promotions']
+        elif mode == 'cashier':
+            tables = [table for table in tables if table != 'customer_addresses']
         columns = {}
         for table in tables:
             names = [r['name'] for r in conn.execute(f'PRAGMA table_info("{table}")')]

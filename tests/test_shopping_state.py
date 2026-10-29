@@ -1,3 +1,4 @@
+from address_support import place_order_with_address, prepare_delivery
 import asyncio
 import json
 import sqlite3
@@ -69,6 +70,7 @@ def draft(tracker, order_id='MEMORY-1'):
     args = {'customer_id':'CUST001','order_id':order_id,'items':[{'item_code':'ITEM001','quantity':1}]}
     result = request_order(**args)
     assert result['ok']
+    prepare_delivery(result['order_id'], 'CUST001')
     tracker.observe('request_order',args,result,'CUST001')
     return result['order_id']
 
@@ -128,19 +130,23 @@ def test_invalid_updates_cannot_poison_saved_state_or_adopt_another_customers_dr
     assert tracker.state['selected_product_ids'] == []
 
 
-def test_pending_must_be_in_visible_reply_and_completed_actions_are_cleared():
+def test_structured_pending_is_rendered_and_completed_actions_are_cleared():
     tracker = ShoppingTracker(None,'CUST001')
     oid = draft(tracker)
     proposal = {'action':'place_order','order_id':oid,'summary':'Place the order?'}
-    tracker.finish(answer('No proposal here.',pending_confirmation=proposal))
-    assert tracker.state['pending_confirmation'] is None
+    visible = tracker.finish(answer('No proposal here.',pending_confirmation=proposal))
+    saved = tracker.state['pending_confirmation']
+    assert saved and saved['summary'] in visible
+    assert '1 x Mechanical keyboard' in visible and 'Total: USD 79.90' in visible
+    assert 'Delivery address for approval:' in visible
     tracker.finish(answer('Place the order?',pending_confirmation=proposal))
-    result = place_order(oid,'CUST001')
+    result = place_order_with_address(oid,'CUST001')
     tracker.observe('place_order',{'order_id':oid},result,'CUST001')
-    tracker.finish(answer('Place the order?',pending_confirmation=proposal))
+    completed = tracker.finish(answer('Place the order?',pending_confirmation=proposal))
     assert tracker.state['pending_confirmation'] is None
     assert tracker.state['current_draft'] is None
     assert tracker.state['last_order']['status'] == 'placed'
+    assert result['invoice_number'] in completed and 'Place the order?' not in completed
 
 
 def test_migration_preserves_old_messages_and_repeated_initialization():
@@ -192,8 +198,13 @@ def test_api_memory_survives_restart_history_limit_and_cached_request(monkeypatc
         context.begin(cid,rid,f'Unrelated turn {i}')
         context.finish(cid,rid,{'response':'Okay'})
     assert 'quiet office work' not in str(context.history(cid))
+    from address_support import ADDRESS_FIELDS
+    from database.addresses import save_address
+    address = save_address('CUST001', ADDRESS_FIELDS)
     second_model = Replay([
         call('request_order',customer_id='CUST001',order_id='RESUMED',items=[{'item_code':'ITEM002','quantity':1}]),
+        call('manage_draft',customer_id='CUST001',order_id='RESUMED',action='select_address',
+             address_id=address['address_id'],confirmed=True),
         answer('Place one mouse for USD 29.50?',selected_product_ids=['ITEM002'],
                pending_confirmation={'action':'place_order','order_id':'RESUMED','summary':'Place one mouse for USD 29.50?'}),
         call('place_order',customer_id='CUST001',order_id='RESUMED'), answer('Your order is placed.'),

@@ -47,3 +47,39 @@ CREATE TABLE IF NOT EXISTS customer_sessions (
  expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_customer_sessions_owner ON customer_sessions(customer_id);
+
+CREATE TABLE IF NOT EXISTS customer_addresses (
+ address_id TEXT PRIMARY KEY,
+ customer_id TEXT NOT NULL REFERENCES customers(customer_id),
+ label TEXT COLLATE NOCASE NOT NULL DEFAULT '',
+ full_name TEXT COLLATE NOCASE NOT NULL CHECK(length(trim(full_name)) BETWEEN 1 AND 200),
+ phone TEXT NOT NULL CHECK(length(phone) BETWEEN 7 AND 30),
+ address_line1 TEXT NOT NULL CHECK(length(trim(address_line1)) BETWEEN 1 AND 200),
+ address_line2 TEXT NOT NULL DEFAULT '',
+ city TEXT COLLATE NOCASE NOT NULL CHECK(length(trim(city)) BETWEEN 1 AND 100),
+ state TEXT COLLATE NOCASE NOT NULL CHECK(length(trim(state)) BETWEEN 1 AND 100),
+ postal_code TEXT NOT NULL CHECK(length(trim(postal_code)) BETWEEN 1 AND 20),
+ country TEXT NOT NULL CHECK(length(country)=2 AND country GLOB '[A-Z][A-Z]'),
+ landmark TEXT NOT NULL DEFAULT '',
+ is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+ active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+ UNIQUE(address_id,customer_id), CHECK(active=1 OR is_default=0)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_customer_default_address ON customer_addresses(customer_id)
+ WHERE active=1 AND is_default=1;
+CREATE UNIQUE INDEX IF NOT EXISTS ix_order_delivery_owner ON orders(order_id,customer_id);
+CREATE TABLE IF NOT EXISTS order_delivery (
+ order_id TEXT PRIMARY KEY,
+ customer_id TEXT NOT NULL,
+ address_id TEXT NOT NULL,
+ address_snapshot TEXT NOT NULL CHECK(json_valid(address_snapshot) AND json_type(address_snapshot)='object'),
+ FOREIGN KEY(order_id,customer_id) REFERENCES orders(order_id,customer_id),
+ FOREIGN KEY(address_id,customer_id) REFERENCES customer_addresses(address_id,customer_id)
+);
+CREATE INDEX IF NOT EXISTS ix_delivery_address ON order_delivery(address_id,customer_id);
+CREATE TRIGGER IF NOT EXISTS delivery_no_issued_update BEFORE UPDATE ON order_delivery
+ WHEN EXISTS(SELECT 1 FROM orders WHERE order_id=OLD.order_id AND order_status<>'draft')
+BEGIN SELECT RAISE(ABORT, 'Issued delivery addresses are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS delivery_no_issued_delete BEFORE DELETE ON order_delivery
+ WHEN EXISTS(SELECT 1 FROM orders WHERE order_id=OLD.order_id AND order_status<>'draft')
+BEGIN SELECT RAISE(ABORT, 'Issued delivery addresses are immutable'); END;

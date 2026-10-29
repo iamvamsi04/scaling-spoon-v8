@@ -1,4 +1,5 @@
 """Order state stays explicit across old imports, retries and cancellation refunds."""
+from address_support import place_order_with_address, prepare_delivery
 from contextlib import closing
 import sqlite3
 
@@ -19,14 +20,15 @@ def scalar(query, args=()):
 def draft():
     result = request_order('CUST001', [{'item_code': 'ITEM001', 'quantity': 1}])
     assert result['ok'] and result['status'] == result['order_status'] == 'draft'
+    prepare_delivery(result['order_id'], 'CUST001')
     return result['order_id']
 
 
 def test_placement_and_retry_expose_status_and_reserve_stock_once():
     oid = draft()
     before = scalar("SELECT availablequantity FROM items WHERE item_code='ITEM001'")
-    first = place_order(oid, 'CUST001')
-    again = place_order(oid, 'CUST001')
+    first = place_order_with_address(oid, 'CUST001')
+    again = place_order_with_address(oid, 'CUST001')
     assert first['ok'] and again['ok'] and again['already_placed']
     assert first['invoice_number'] == again['invoice_number']
     assert first['order_status'] == again['order_status'] == 'placed'
@@ -41,7 +43,7 @@ def test_blank_invoice_remains_a_draft_and_can_be_placed(invoice):
     with transaction() as conn:
         conn.execute('UPDATE orders SET order_invoice=? WHERE order_id=?', (invoice, oid))
     assert scalar('SELECT order_status FROM orders WHERE order_id=?', (oid,)) == 'draft'
-    assert place_order(oid, 'CUST001')['ok']
+    assert place_order_with_address(oid, 'CUST001')['ok']
     assert scalar('SELECT order_status FROM orders WHERE order_id=?', (oid,)) == 'placed'
 
 
@@ -50,7 +52,7 @@ def test_direct_invoice_import_derives_placed_state():
         conn.execute("INSERT INTO orders(order_id,customer_id,order_invoice,subtotal,charged_price) "
                      "VALUES ('IMPORTED','CUST001','INV-IMPORTED',10,10)")
     assert scalar("SELECT order_status FROM orders WHERE order_id='IMPORTED'") == 'placed'
-    assert place_order('IMPORTED', 'CUST001')['already_placed']
+    assert place_order_with_address('IMPORTED', 'CUST001')['already_placed']
 
 
 @pytest.mark.parametrize('change', [
@@ -58,7 +60,7 @@ def test_direct_invoice_import_derives_placed_state():
 ])
 def test_issued_state_and_invoice_identity_cannot_be_reverted(change):
     oid = draft()
-    assert place_order(oid, 'CUST001')['ok']
+    assert place_order_with_address(oid, 'CUST001')['ok']
     with pytest.raises(sqlite3.IntegrityError), transaction() as conn:
         conn.execute('UPDATE orders SET ' + change + ' WHERE order_id=?', (oid,))
     assert scalar('SELECT order_status FROM orders WHERE order_id=?', (oid,)) == 'placed'
@@ -68,7 +70,7 @@ def test_cancelled_draft_cannot_be_reopened_or_placed():
     oid = draft()
     result = manage_draft(oid, 'CUST001', 'cancel', reason='Changed mind', confirmed=True)
     assert result['ok'] and result['order_status'] == 'cancelled'
-    assert not place_order(oid, 'CUST001')['ok']
+    assert not place_order_with_address(oid, 'CUST001')['ok']
     assert manage_draft(oid, 'CUST001', 'cancel', reason='Changed mind', confirmed=True)['already_cancelled']
     with pytest.raises(sqlite3.IntegrityError), transaction() as conn:
         conn.execute("UPDATE orders SET order_status='draft' WHERE order_id=?", (oid,))
@@ -79,13 +81,13 @@ def test_cancelled_draft_cannot_be_reopened_or_placed():
 
 def test_cancelled_issued_order_only_approves_existing_cancellation_request():
     oid = draft()
-    assert place_order(oid, 'CUST001')['ok']
+    assert place_order_with_address(oid, 'CUST001')['ok']
     invoice = scalar('SELECT order_invoice FROM orders WHERE order_id=?', (oid,))
     before = scalar("SELECT availablequantity FROM items WHERE item_code='ITEM001'")
     result = manage_draft(oid, 'CUST001', 'cancel', reason='Changed mind', confirmed=True)
     assert result['ok'] and result['order_status'] == 'cancelled'
     assert scalar('SELECT order_invoice FROM orders WHERE order_id=?', (oid,)) == invoice
-    assert not place_order(oid, 'CUST001')['ok']
+    assert not place_order_with_address(oid, 'CUST001')['ok']
     customer = scoped_tool(process_refund)
     assert not customer(oid, 'CUST001', 'Changed mind', execution_customer_id='CUST001')['ok']
     result = scoped_tool(process_refund)(oid, 'CUST001', 'Changed mind', action='approve',
@@ -106,7 +108,7 @@ def test_legacy_cancellation_fields_synchronize_authoritative_state(table, colum
             conn.execute('INSERT INTO order_service(order_id) VALUES (?)', (oid,))
         conn.execute(f"UPDATE {table} SET {column}='cancelled' WHERE order_id=?", (oid,))
     assert scalar('SELECT order_status FROM orders WHERE order_id=?', (oid,)) == 'cancelled'
-    assert not place_order(oid, 'CUST001')['ok']
+    assert not place_order_with_address(oid, 'CUST001')['ok']
 
 
 def test_incomplete_legacy_fulfillment_does_not_become_a_placed_order():
@@ -114,7 +116,7 @@ def test_incomplete_legacy_fulfillment_does_not_become_a_placed_order():
     with transaction() as conn:
         conn.execute("INSERT INTO order_fulfilled(order_id,item_code,quantity) VALUES (?,'ITEM001',1)", (oid,))
     assert scalar('SELECT order_status FROM orders WHERE order_id=?', (oid,)) == 'draft'
-    result = place_order(oid, 'CUST001')
+    result = place_order_with_address(oid, 'CUST001')
     assert not result['ok'] and 'unissued' in result['error']
     assert not manage_draft(oid, 'CUST001', 'replace_items', items=[{'item_code': 'ITEM002', 'quantity': 1}], confirmed=True)['ok']
 
@@ -123,7 +125,7 @@ def test_draft_with_legacy_refund_cannot_be_bought_or_edited():
     oid = draft()
     with transaction() as conn:
         conn.execute("UPDATE orders SET refund_amount=10,refund_status='recorded' WHERE order_id=?", (oid,))
-    assert not place_order(oid, 'CUST001')['ok']
+    assert not place_order_with_address(oid, 'CUST001')['ok']
     assert not manage_draft(oid, 'CUST001', 'replace_items', items=[{'item_code': 'ITEM002', 'quantity': 1}], confirmed=True)['ok']
     assert scalar('SELECT order_status FROM orders WHERE order_id=?', (oid,)) == 'draft'
 
@@ -179,8 +181,8 @@ def test_analytics_uses_lifecycle_even_without_legacy_cancellation_metadata():
     active = draft()
     cancelled = draft()
     waiting = draft()
-    assert place_order(active, 'CUST001')['ok']
-    assert place_order(cancelled, 'CUST001')['ok']
+    assert place_order_with_address(active, 'CUST001')['ok']
+    assert place_order_with_address(cancelled, 'CUST001')['ok']
     with transaction() as conn:
         conn.execute("UPDATE orders SET order_status='cancelled' WHERE order_id=?", (cancelled,))
         conn.execute("UPDATE orders SET order_invoice='   ' WHERE order_id=?", (waiting,))

@@ -1,3 +1,4 @@
+from address_support import place_order_with_address, prepare_delivery
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -38,20 +39,22 @@ def test_invalid_sql_numeric_parameters_return_a_tool_error(value):
 
 def test_audit_failure_rolls_back_order_and_stock():
     oid=request_order('CUST001',[{'item_code':'ITEM001','quantity':1}])['order_id']
+    prepare_delivery(oid, 'CUST001')
     with transaction() as conn:
         conn.execute("CREATE TRIGGER fail_audit BEFORE INSERT ON billing_audit WHEN NEW.action='place_order' BEGIN SELECT RAISE(ABORT,'Storage failure'); END")
-    assert not place_order(oid,'CUST001')['ok']
+    assert not place_order_with_address(oid,'CUST001')['ok']
     assert scalar("SELECT availablequantity FROM items WHERE item_code='ITEM001'")==40
     assert scalar('SELECT COUNT(*) FROM invoice_lines')==0
     assert scalar('SELECT COUNT(*) FROM order_fulfilled')==0
     assert scalar('SELECT order_invoice FROM orders') is None
-    assert scalar('SELECT COUNT(*) FROM billing_audit')==1
+    assert scalar('SELECT COUNT(*) FROM billing_audit')==3
 
 
 def test_concurrent_identical_placements_and_refunds_are_single_writes():
     oid=request_order('CUST001',[{'item_code':'ITEM001','quantity':1}])['order_id']
+    prepare_delivery(oid, 'CUST001')
     with ThreadPoolExecutor(4) as pool:
-        results=list(pool.map(lambda _:place_order(oid,'CUST001'),range(4)))
+        results=list(pool.map(lambda _:place_order_with_address(oid,'CUST001'),range(4)))
     assert all(r['ok'] for r in results)
     assert len({r['invoice_number'] for r in results})==1
     assert scalar("SELECT availablequantity FROM items WHERE item_code='ITEM001'")==39
@@ -59,7 +62,7 @@ def test_concurrent_identical_placements_and_refunds_are_single_writes():
     with ThreadPoolExecutor(4) as pool:
         results=list(pool.map(lambda _:process_refund(oid,'CUST001','Return','10.00'),range(4)))
     assert sum(r['ok'] for r in results)==1
-    assert scalar('SELECT COUNT(*) FROM billing_audit')==4
+    assert scalar('SELECT COUNT(*) FROM billing_audit')==6
 
 
 @pytest.mark.parametrize('tax,shipping',[('NaN','0'),('Infinity','0'),('-1','0'),('101','0'),('0','-1'),('0','NaN')])

@@ -1,3 +1,4 @@
+from address_support import place_order_with_address, prepare_delivery
 from contextlib import closing
 import pytest
 from config import settings
@@ -10,7 +11,7 @@ refund=scoped_tool(process_refund)
 
 def order(age):
     oid=request_order('CUST001',[{'item_code':'ITEM001','quantity':2}])['order_id']
-    assert place_order(oid,'CUST001')['ok']
+    assert place_order_with_address(oid,'CUST001')['ok']
     with transaction() as conn:
         conn.execute("UPDATE orders SET order_date=date('now',?) WHERE order_id=?",(f'{-age:+d} days',oid))
     return oid

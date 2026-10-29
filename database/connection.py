@@ -17,6 +17,7 @@ CASE_INSENSITIVE_COLUMNS = {
     'order_details': frozenset({'status'}),
     'refund_requests': frozenset({'status'}),
     'order_service': frozenset({'fulfillment_status'}),
+    'customer_addresses': frozenset({'label', 'full_name', 'city', 'state'}),
 }
 
 

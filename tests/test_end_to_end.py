@@ -50,6 +50,11 @@ def setup_engine(monkeypatch, script):
 
 
 def test_complete_customer_journey_then_admin_reports(monkeypatch):
+    from api.customer_auth import register
+    from address_support import ADDRESS_FIELDS
+    from database.addresses import save_address
+    register('E2E-CUSTOMER','Demo Shopper','Example-pass-1234')
+    address = save_address('E2E-CUSTOMER', ADDRESS_FIELDS)
     setup_engine(monkeypatch,[
         call('execute_sql_query',query="SELECT COALESCE(NULLIF(TRIM(d.category),''),'Uncategorised') AS category, COUNT(*) AS products, SUM(CASE WHEN i.availablequantity>0 THEN 1 ELSE 0 END) AS in_stock_products FROM items i LEFT JOIN product_details d ON d.item_code=i.item_code GROUP BY COALESCE(NULLIF(TRIM(d.category),''),'Uncategorised') ORDER BY category"),
         reply('The store has 3 products across 1 category. All 3 products are currently in stock.'),
@@ -61,6 +66,8 @@ def test_complete_customer_journey_then_admin_reports(monkeypatch):
         call('compare_products',products=['ITEM001','ITEM002']),
         call('find_cheaper_alternatives',product_reference='ITEM001'),reply('Here are your options.'),
         call('request_order',customer_id='E2E-CUSTOMER',order_id='E2E-ORDER',items=[{'item_code':'ITEM001','quantity':1}]),
+        call('manage_draft',customer_id='E2E-CUSTOMER',order_id='E2E-ORDER',action='select_address',
+             address_id=address['address_id'],confirmed=True),
         call('apply_promotion',customer_id='E2E-CUSTOMER',order_id='E2E-ORDER',promo_code='SAVE10'),propose('place_order','E2E-ORDER','One keyboard in E2E-ORDER costs USD 71.91. Shall I place it?'),
         propose('replace_items','E2E-ORDER','Replace the complete E2E-ORDER basket with two ITEM001 keyboards? The quoted total will be USD 143.82.',items=[{'item_code':'ITEM001','quantity':2}]),
         call('manage_draft',customer_id='E2E-CUSTOMER',order_id='E2E-ORDER',action='replace_items',items=[{'item_code':'ITEM001','quantity':2}],confirmed=True),propose('place_order','E2E-ORDER','Two ITEM001 keyboards in E2E-ORDER cost USD 143.82. Shall I place the order?'),
@@ -89,7 +96,7 @@ def test_complete_customer_journey_then_admin_reports(monkeypatch):
         assert first['response']=='Showing products 1 through 2 of 3.'
         assert first['shopping_state']['product_query']['parameters']==[2,0]
         assert chat('next page')['shopping_state']['product_query']['parameters']==[2,2]
-        account=client.post('/customers/register',json={'customer_id':'E2E-CUSTOMER','name':'Demo Shopper','password':'Example-pass-1234'}).json()
+        account=client.post('/customers/login',json={'customer_id':'E2E-CUSTOMER','password':'Example-pass-1234'}).json()
         client.headers['X-Customer-Token']=account['token']
         cid=client.post('/conversations',json={'customer_id':'E2E-CUSTOMER'}).json()['conversation_id']
         chat('Update my company to Demo Company.')
@@ -123,13 +130,18 @@ def test_complete_customer_journey_then_admin_reports(monkeypatch):
         with closing(connect()) as conn:
             assert conn.execute("SELECT refund_amount FROM orders WHERE order_id='E2E-ORDER'").fetchone()[0] is None
             assert conn.execute("SELECT status FROM order_details WHERE order_id='E2E-CANCEL'").fetchone()[0]=='cancelled'
-            assert conn.execute('SELECT COUNT(*) FROM billing_audit').fetchone()[0]==8
+            assert conn.execute('SELECT COUNT(*) FROM billing_audit').fetchone()[0]==10
             assert not conn.execute('PRAGMA foreign_key_check').fetchall()
 
 
 def test_streamlit_to_api_to_real_mcp_order(monkeypatch):
+    from address_support import ADDRESS_FIELDS
+    from database.addresses import save_address
+    address = save_address('CUST001', ADDRESS_FIELDS)
     setup_engine(monkeypatch,[
-        call('request_order',customer_id='CUST001',order_id='UI-ORDER',items=[{'item_code':'ITEM002','quantity':1}]),propose('place_order','UI-ORDER','One ITEM002 mouse in UI-ORDER costs USD 29.50. Place this order?'),
+        call('request_order',customer_id='CUST001',order_id='UI-ORDER',items=[{'item_code':'ITEM002','quantity':1}]),
+        call('manage_draft',customer_id='CUST001',order_id='UI-ORDER',action='select_address',address_id=address['address_id'],confirmed=True),
+        propose('place_order','UI-ORDER','One ITEM002 mouse in UI-ORDER costs USD 29.50. Place this order?'),
         call('place_order',customer_id='CUST001',order_id='UI-ORDER'),reply('Your mouse order is placed.')])
     original=httpx.Client.request
     with TestClient(app) as client:

@@ -27,11 +27,13 @@ class Proposal(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: Literal['place_order', 'replace_items', 'cancel_draft',
                     'update_customer', 'process_refund', 'cancel_order', 'apply_store_credit',
-                    'correct_invoice', 'report_billing_issue', 'escalate_refund', 'bulk_refund', 'apply_promotion']
+                    'correct_invoice', 'report_billing_issue', 'escalate_refund', 'bulk_refund', 'apply_promotion',
+                    'add_address', 'update_address', 'delete_address', 'set_default_address']
     order_id: ProductID | None = None
     promo_code: ProductID | None = None
     summary: str = Field(min_length=1, max_length=1500)
     arguments: dict | None = None
+    delivery: dict | None = None
 
     @field_validator('arguments')
     @classmethod
@@ -106,6 +108,20 @@ def clear_confirmation(state):
     result['pending_confirmation'] = result['next_question'] = None
     result['stage'] = shopping_stage(result)
     return result
+
+
+def placement_review(order):
+    """Render the actual saved quote; model-written amounts never authorize it."""
+    currency = order['currency']
+    summary = f"Please confirm order {order['order_id']} for {currency} {order['totals']['charged_price']}."
+    lines = [summary, 'Items:']
+    lines.extend(f"{item['quantity']} x {item['name']}" for item in order['items'])
+    for key, label in (('subtotal','Subtotal'), ('discount_applied','Discount'),
+                       ('tax_amount','Tax'), ('shipping_amount','Shipping'), ('charged_price','Total')):
+        lines.append(f"{label}: {currency} {order['totals'][key]}")
+    lines.append(f"Store credit: {currency} {order['store_credit_requested']}")
+    lines.append(f"Remaining invoice amount: {currency} {order['remaining_invoice_amount']}")
+    return summary, '\n'.join(lines)
 
 
 def canonical_proposal_arguments(arguments):
@@ -201,6 +217,13 @@ def order_snapshot(order_id, customer_id):
             FROM refund_requests r LEFT JOIN refund_details d ON d.order_id=r.order_id WHERE r.order_id=?''',
             (order_id,)).fetchone()
         result['refund_request'] = dict(refund) if refund else None
+        from database.addresses import selected_address
+        try:
+            delivery = selected_address(conn, order_id, customer_id)
+        except ValueError:
+            delivery = None
+        result['address_id'] = delivery['address_id'] if delivery else None
+        result['delivery_address'] = delivery['delivery_address'] if delivery else None
         result['invoice_revision'] = conn.execute('SELECT MAX(id) FROM invoice_revisions WHERE order_id=?',
                                                  (order_id,)).fetchone()[0]
         if row['order_invoice']:
@@ -314,7 +337,11 @@ class ShoppingTracker:
                 self.completed_actions.add(('correct_invoice', corrected[0]))
         elif name == 'manage_customer':
             self.state['pending_confirmation'] = None
-            self.completed_actions.add((arguments.get('action','create')+'_customer', None))
+            action = arguments.get('action','create')
+            self.completed_actions.add((action if action in ('add_address','update_address','delete_address','set_default_address')
+                                        else action+'_customer', None))
+            if self.state.get('current_draft'):
+                self.set_order(order_snapshot(self.state['current_draft']['order_id'], customer_id))
         self.stage()
         if self.checkpoint:
             self.checkpoint(deepcopy(self.state), self.customer_id)
@@ -358,16 +385,18 @@ class ShoppingTracker:
             self.set_order(snapshot)
         self.state['next_question'] = update.get('next_question')
         proposed = update.get('pending_confirmation')
-        if proposed and proposed['summary'] in reply and (proposed['action'], proposed.get('order_id')) not in self.completed_actions:
+        if proposed and (proposed['action'], proposed.get('order_id')) not in self.completed_actions:
             order_id = proposed.get('order_id')
             order = order_snapshot(order_id, self.customer_id) if order_id else None
             action = proposed['action']
-            account_action = action == 'update_customer'
+            account_action = action in ('update_customer','add_address','update_address','delete_address','set_default_address')
             bulk_action = action == 'bulk_refund'
             expected = ('placed', 'cancelled') if action in ('correct_invoice', 'report_billing_issue', 'escalate_refund') else (
                 ('placed',) if action in ('process_refund', 'cancel_order') else ('draft',))
             eligible = bool(order and order['status'] in expected)
-            if action == 'cancel_order':
+            if action == 'place_order':
+                eligible = eligible and bool(order['delivery_address'])
+            elif action == 'cancel_order':
                 eligible = eligible and order['fulfillment_status'] == 'placed' and not order['refund_request'] and order['refund']['refund_amount'] is None
             elif action == 'process_refund':
                 eligible = eligible and not order['refund_request'] and order['refund']['refund_amount'] is None
@@ -381,6 +410,12 @@ class ShoppingTracker:
                     (not account_action and not bulk_action and eligible)):
                 proposed['status'] = 'awaiting_customer'
                 proposed['order_fingerprint'] = order['fingerprint'] if order else None
+                if action == 'place_order':
+                    proposed['summary'] = placement_review(order)[0]
+                    proposed['arguments'] = None
+                    proposed['delivery'] = {'address_id': order['address_id'],
+                                            'delivery_address': order['delivery_address']}
+                    self.set_order(order)
                 self.state['pending_confirmation'] = proposed
         self.stage()
 
@@ -410,6 +445,19 @@ class ShoppingTracker:
         update = deepcopy(envelope['shopping_update'])
         if isinstance(update, dict):
             proposal = update.get('pending_confirmation')
+            if (isinstance(proposal, dict) and proposal.get('action') == 'place_order'
+                    and ('place_order', proposal.get('order_id')) in self.completed_actions):
+                placed = order_snapshot(proposal.get('order_id'), self.customer_id)
+                if placed and placed['invoice_number']:
+                    reply = f"Order {placed['order_id']} was placed. Invoice {placed['invoice_number']} was issued."
+                    update['pending_confirmation'] = None
+                    if update.get('active_draft_id') == placed['order_id']:
+                        update['active_draft_id'] = None
+            if isinstance(proposal, dict) and proposal.get('action') == 'place_order':
+                order = order_snapshot(proposal.get('order_id'), self.customer_id)
+                if order and order['status'] == 'draft' and not order['delivery_address']:
+                    update['pending_confirmation'] = None
+                    reply += '\n\nSelect a delivery address for this draft in Delivery addresses and checkout, then review the complete order before confirming placement.'
             if isinstance(proposal, dict) and isinstance(proposal.get('summary'), str):
                 proposal['summary'] = plain_reply(proposal['summary'])
             if isinstance(update.get('next_question'), str):
@@ -418,9 +466,24 @@ class ShoppingTracker:
         try:
             self.apply_update(update, reply)
             proposal = self.state.get('pending_confirmation')
+            if proposal and proposal['action'] == 'place_order':
+                reply = placement_review(self.state['current_draft'])[1]
+            elif proposal and proposal['summary'] not in reply:
+                # Presentation deduplication only: persistence never depends on
+                # matching the model's summary wording to its visible prose.
+                reply += '\n\n' + proposal['summary']
             if proposal and proposal.get('arguments'):
                 details = proposal_details(proposal['arguments'])
                 reply += '\n\nDetails for approval:\n' + details
+            if proposal and proposal.get('action') == 'place_order':
+                delivery = (proposal.get('delivery') or {}).get('delivery_address')
+                if delivery:
+                    fields = (('full_name', 'Full name'), ('phone', 'Phone'),
+                              ('address_line1', 'Address line 1'), ('address_line2', 'Address line 2'),
+                              ('city', 'City'), ('state', 'State / province / region'),
+                              ('postal_code', 'Postal code'), ('country', 'Country'), ('landmark', 'Landmark'))
+                    lines = [f'{label}: {delivery[key]}' for key, label in fields if delivery.get(key)]
+                    reply += '\n\nDelivery address for approval:\n' + '\n'.join(lines)
         except (ValidationError, ValueError, TypeError):
             self.state = saved
             self.stage()

@@ -3,14 +3,14 @@ import hmac
 import logging
 import json
 from time import perf_counter
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from uuid import UUID
 from typing import Literal
 from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from openai import APIConnectionError, APITimeoutError, APIStatusError
 from config import settings
 from context import context_manager as context
@@ -19,6 +19,7 @@ from context.tables import sanitize_tables
 from context.reports import sanitize_reports
 from context.shopping_state import clear_confirmation
 from database.connection import initialize as initialize_billing
+from database.connection import connect
 from database.invoice import invoice_path
 from api import customer_auth
 
@@ -109,6 +110,8 @@ app = FastAPI(title="Billing Agent", version="7.0.0", lifespan=lifespan,
 
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, exc):
+    if request.url.path.startswith(('/customers/addresses', '/customers/orders/')):
+        return JSONResponse(status_code=422, content={'detail': 'Check the required delivery address fields and their lengths.'})
     if request.url.path.startswith('/customers/'):
         return JSONResponse(status_code=422, content={'detail': 'Check the customer ID, account details and password length (10 to 128 characters).'})
     # Do not echo user-supplied values in error responses.
@@ -171,6 +174,104 @@ def customer_session(x_customer_token: str | None = Header(default=None)):
     if not session:
         raise HTTPException(401, 'Your customer session ended. Please sign in again.', headers={'Cache-Control': 'no-store'})
     return JSONResponse(session, headers={'Cache-Control': 'no-store'})
+
+
+class DeliveryAddress(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    full_name: str = Field(min_length=1, max_length=200)
+    phone: str = Field(min_length=1, max_length=30)
+    address_line1: str = Field(min_length=1, max_length=200)
+    address_line2: str = Field(default='', max_length=200)
+    city: str = Field(min_length=1, max_length=100)
+    state: str = Field(min_length=1, max_length=100)
+    postal_code: str = Field(min_length=1, max_length=20)
+    country: str = Field(min_length=2, max_length=2)
+    label: str = Field(default='', max_length=50)
+    landmark: str = Field(default='', max_length=200)
+    is_default: bool = Field(default=False, strict=True)
+
+
+class DeliveryAddressSelection(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    address_id: str = Field(min_length=1, max_length=50, pattern=r'^[A-Za-z0-9_-]+$')
+
+
+def address_customer(token):
+    customer_id = customer_auth.customer_for_token(token)
+    if not customer_id:
+        raise HTTPException(401, 'Sign in to manage your delivery addresses.', headers={'Cache-Control': 'no-store'})
+    return customer_id
+
+
+def address_result(operation, *args, status_code=200, **kwargs):
+    try:
+        result = operation(*args, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc), headers={'Cache-Control': 'no-store'}) from exc
+    return JSONResponse(result, status_code=status_code, headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/customers/addresses')
+def customer_addresses(x_customer_token: str | None = Header(default=None)):
+    from database.addresses import list_addresses
+    customer_id = address_customer(x_customer_token)
+    return JSONResponse({'addresses': list_addresses(customer_id)}, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/customers/addresses', status_code=201)
+def add_delivery_address(body: DeliveryAddress, x_customer_token: str | None = Header(default=None)):
+    from database.addresses import save_address
+    return address_result(lambda: {'address': save_address(address_customer(x_customer_token), body.model_dump())}, status_code=201)
+
+
+@app.put('/customers/addresses/{address_id}')
+def update_delivery_address(address_id: str, body: DeliveryAddress, x_customer_token: str | None = Header(default=None)):
+    from database.addresses import save_address
+    return address_result(lambda: {'address': save_address(address_customer(x_customer_token), body.model_dump(), address_id=address_id)})
+
+
+@app.delete('/customers/addresses/{address_id}')
+def remove_delivery_address(address_id: str, x_customer_token: str | None = Header(default=None)):
+    from database.addresses import delete_address
+    return address_result(delete_address, address_customer(x_customer_token), address_id)
+
+
+@app.post('/customers/addresses/{address_id}/default')
+def default_delivery_address(address_id: str, x_customer_token: str | None = Header(default=None)):
+    from database.addresses import set_default_address
+    return address_result(lambda: {'address': set_default_address(address_customer(x_customer_token), address_id)})
+
+
+@app.put('/customers/orders/{order_id}/delivery-address')
+def select_delivery_address(order_id: str, body: DeliveryAddressSelection, x_customer_token: str | None = Header(default=None)):
+    from database.addresses import select_order_address
+    return address_result(select_order_address, order_id, address_customer(x_customer_token), body.address_id)
+
+
+@app.get('/customers/checkout')
+def customer_checkout(x_customer_token: str | None = Header(default=None)):
+    from database.addresses import list_addresses
+    customer_id = address_customer(x_customer_token)
+    with closing(connect(readonly=True)) as conn:
+        conn.execute('BEGIN')
+        rows = conn.execute('''SELECT o.order_id,o.charged_price,
+            COALESCE(d.currency,(SELECT value FROM billing_config WHERE key='currency'),'USD') AS currency,
+            delivery.address_id,delivery.address_snapshot
+            FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id
+            LEFT JOIN order_delivery delivery ON delivery.order_id=o.order_id
+            WHERE o.customer_id=? AND o.order_status='draft'
+              AND COALESCE(d.status,'active')<>'cancelled'
+            ORDER BY o.order_date DESC,o.order_id''', (customer_id,)).fetchall()
+        orders = []
+        for row in rows:
+            order = {key: row[key] for key in ('order_id', 'charged_price', 'currency', 'address_id')}
+            try:
+                snapshot = json.loads(row['address_snapshot']) if row['address_snapshot'] else None
+            except (ValueError, TypeError):
+                snapshot = None
+            order['delivery_address'] = snapshot if isinstance(snapshot, dict) else None
+            orders.append(order)
+    return JSONResponse({'addresses': list_addresses(customer_id), 'orders': orders}, headers={'Cache-Control': 'no-store'})
 
 
 @app.get("/health")

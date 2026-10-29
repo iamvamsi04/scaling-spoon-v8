@@ -1,4 +1,5 @@
 """Conversation state follows committed work and keeps account scope fixed."""
+from address_support import place_order_with_address, prepare_delivery
 import asyncio
 from contextlib import closing
 import json
@@ -18,8 +19,9 @@ from mcp_server.tools.operations_tools import manage_customer
 def order(placed=True):
     result = request_order('CUST001', [{'item_code': 'ITEM001', 'quantity': 1}])
     assert result['ok']
+    prepare_delivery(result['order_id'], 'CUST001')
     if placed:
-        assert place_order(result['order_id'], 'CUST001')['ok']
+        assert place_order_with_address(result['order_id'], 'CUST001')['ok']
     return result['order_id']
 
 
@@ -27,7 +29,14 @@ def proposal(tracker, action, order_id):
     summary = 'Please confirm this exact service action.'
     reply = tracker.finish(json.dumps({'reply': summary, 'shopping_update': {
         'pending_confirmation': {'action': action, 'order_id': order_id, 'summary': summary}}}))
-    assert reply == summary
+    if action == 'place_order' and tracker.state['pending_confirmation']:
+        assert reply.startswith(tracker.state['pending_confirmation']['summary'] + '\nItems:\n')
+        assert 'Delivery address for approval:' in reply
+        delivery = order_snapshot(order_id, tracker.customer_id)['delivery_address']
+        assert tracker.state['pending_confirmation']['delivery']['delivery_address'] == delivery
+        assert all(value in reply for value in delivery.values() if value)
+    else:
+        assert reply == summary
     return tracker.state['pending_confirmation']
 
 
@@ -147,7 +156,7 @@ def test_customer_schema_requires_explicit_profile_update():
                           'required':['customer_id','name']}}]
         schema = (await workbench.list_tools())[0]
         action = schema['parameters']['properties']['action']
-        assert action['enum'] == ['update'] and 'default' not in action
+        assert action['enum'] == ['update','add_address','update_address','delete_address','set_default_address'] and 'default' not in action
         assert 'action' in schema['parameters']['required']
     asyncio.run(run())
 

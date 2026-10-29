@@ -35,17 +35,44 @@ def ensure_customer(conn, customer_id):
 
 
 @tool_result
-def manage_customer(customer_id: str, name: str, company: str | None = None, email: str | None = None,
+def manage_customer(customer_id: str, name: str = '', company: str | None = None, email: str | None = None,
                     action: str = 'create', confirmed: bool = False, billing_address: str | None = None,
-                    tax_registration_number: str | None = None) -> dict:
+                    tax_registration_number: str | None = None, address: dict | None = None,
+                    address_id: str | None = None) -> dict:
     """Create or update a customer after confirmation. Show the proposed contact changes first.
 
     Updates preserve omitted company/email fields. Explicit empty strings clear those fields.
 
     Existing issued invoice contact snapshots are preserved. Use SQL to look up a customer before editing.
+    Address actions add_address/update_address/delete_address/set_default_address manage saved delivery
+    addresses, not billing contact details. address contains full_name,phone,address_line1,city,state,
+    postal_code,country (two-letter code); label,address_line2,landmark,is_default are optional.
+    Updates may contain only changed address fields. Supply address_id for every action except add_address.
     """
     confirm(confirmed)
     identifier(customer_id, 'customer ID')
+    if action in ('add_address', 'update_address', 'delete_address', 'set_default_address'):
+        from database.addresses import save_address, delete_address, set_default_address
+        if name or any(value is not None for value in (company,email,billing_address,tax_registration_number)):
+            raise BillingError('Change saved delivery addresses separately from customer profile and billing details.')
+        if action in ('delete_address','set_default_address') and address is not None:
+            raise BillingError('This address action accepts an address ID, not replacement address fields.')
+        if action == 'add_address' and address_id is not None:
+            raise BillingError('A new address must not supply an existing address ID.')
+        if action != 'add_address' and not address_id:
+            raise BillingError('Choose a saved address before changing it.')
+        try:
+            if action in ('add_address', 'update_address'):
+                result = save_address(customer_id, address, address_id)
+            elif action == 'delete_address':
+                result = delete_address(customer_id, address_id)
+            else:
+                result = set_default_address(customer_id, address_id)
+        except ValueError as exc:
+            raise BillingError(str(exc)) from exc
+        return {'customer_id': customer_id, 'action': action, **result}
+    if address is not None or address_id is not None:
+        raise BillingError('Use a delivery address action to save or select address details.')
     name = text(name, 'Name', 200)
     if company is not None and (not isinstance(company, str) or len(company) > 200):
         raise BillingError('Company must contain at most 200 characters.')
@@ -86,7 +113,8 @@ def manage_customer(customer_id: str, name: str, company: str | None = None, ema
 
 @tool_result
 def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict] | None = None,
-                 reason: str = '', confirmed: bool = False, credit_amount: str | None = None) -> dict:
+                 reason: str = '', confirmed: bool = False, credit_amount: str | None = None,
+                 address_id: str | None = None) -> dict:
     """After confirmation: replace_items edits drafts; cancel cancels drafts or whole unshipped issued orders.
     apply_store_credit allocates credit_amount to an owned draft; report_billing_issue stores reason for review.
     Authenticated admin only: ship/deliver update issued-order fulfillment status.
@@ -94,6 +122,7 @@ def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict]
     items is the complete desired list of item_code and integer quantity. Issued invoice lines and totals are immutable.
     Cancellation retains records; only whole unshipped issued orders restore their fulfilled stock.
     Set credit_amount to zero to clear a draft's store-credit allocation.
+    select_address explicitly chooses an owned active saved address_id for a draft; this does not place it.
     """
     confirm(confirmed)
     from mcp_server.access import scope
@@ -107,6 +136,14 @@ def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict]
             if owner and owner[0] == customer_id:
                 return {'order_id': order_id, 'status': 'cancelled', 'order_status': 'cancelled', 'already_cancelled': True}
         order = order_row(conn, order_id, customer_id)
+        if action == 'select_address':
+            from database.addresses import select_order_address_conn
+            if items is not None or credit_amount is not None or reason:
+                raise BillingError('Select the delivery address separately from basket, credit or cancellation changes.')
+            try:
+                return select_order_address_conn(conn, order_id, customer_id, address_id)
+            except ValueError as exc:
+                raise BillingError(str(exc)) from exc
         if action in ('ship','deliver'):
             from mcp_server.tools.service_workflows import fulfillment_transition
             return fulfillment_transition(conn,order,action)

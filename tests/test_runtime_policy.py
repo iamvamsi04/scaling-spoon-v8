@@ -91,7 +91,7 @@ def test_cleared_proposal_and_preferences_cannot_be_inferred_from_old_transcript
 
 def test_runtime_customer_keeps_precise_patch_and_coupon_contract():
     prompt = runtime_policy('customer', 'CUST001', empty_state())
-    for rule in ('EXACTLY {"reply"', 'No text/fences/second answer', 'VERBATIM',
+    for rule in ('EXACTLY {"reply"', 'No text/fences/second answer', 'the app ensures it is displayed',
                  'No confirmed/approved/role/customer_id', 'user-supplied/requested',
                  'never disclose/discover/choose highest', 'action=validate',
                  'One coupon/order', 'displayed_product_ids', 'category_overview',

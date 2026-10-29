@@ -81,19 +81,114 @@ def return_quote(conn, order, items):
     return value,saved
 
 
+def refund_approval_check(conn, order, role, *, return_received=False, waiver_reason=''):
+    """Read the pending request against current invoice facts before any approval write.
+
+    Financial eligibility and physical-return readiness are separate: a valid
+    merchandise request may still need staff to attest that the goods arrived.
+    The approval transaction repeats this same check with the supplied evidence.
+    """
+    from config import settings
+    from mcp_server.tools.billing_tools import check_return_window, _refund_items
+    request = conn.execute('SELECT * FROM refund_requests WHERE order_id=?', (order['order_id'],)).fetchone()
+    details = conn.execute('SELECT * FROM refund_details WHERE order_id=?', (order['order_id'],)).fetchone()
+    kind = details['request_kind'] if details else 'return'
+    result = {'valid': False, 'ready_to_approve': False, 'request_kind': kind,
+              'requested_amount': None, 'eligible_amount': None, 'currency': None,
+              'nonrefundable_shipping': None, 'return_receipt_required': False,
+              'reasons': []}
+    try:
+        if role not in ('admin', 'cashier'):
+            raise BillingError('Only a cashier or admin can approve refunds.')
+        if not is_placed(conn, order):
+            raise BillingError('Only placed orders can be refunded.')
+        check_return_window(conn, order)
+        if order['refund_status'] or order['refund_amount'] is not None:
+            raise BillingError('A refund is already recorded; duplicate refunds are blocked.')
+        if conn.execute("SELECT 1 FROM store_credit_ledger WHERE order_id=? AND kind='refund_credit'",
+                        (order['order_id'],)).fetchone():
+            raise BillingError('A store credit refund is already recorded; duplicate refunds are blocked. Staff must reconcile the request history.')
+        if not request or request['status'] != 'pending':
+            raise BillingError('An existing pending customer refund request is required before approval.')
+        if not isinstance(request['reason'], str) or not request['reason'].strip() or len(request['reason']) > 2000:
+            raise BillingError('The pending refund request has no valid reason. Staff review is required.')
+        currency = currency_for(conn, order['order_id'])
+        if request['currency'].strip().upper() != currency:
+            raise BillingError('The pending refund request currency does not match the invoice currency.')
+        refund = money(request['amount'])
+        total = money(order['charged_price'])
+        shipping = money(order['shipping_amount'])
+        result.update(requested_amount=str(refund), currency=currency,
+                      nonrefundable_shipping=str(shipping if kind == 'return' else money(0)))
+        if refund <= 0 or refund > total:
+            raise BillingError('Refund must be positive and no greater than the invoice total.')
+        if order['order_status'] == 'cancelled' and kind != 'cancellation':
+            raise BillingError('Cancelled orders only allow approval of their existing cancellation refund request.')
+        if kind == 'cancellation' and order['order_status'] != 'cancelled':
+            raise BillingError('A cancellation refund requires an already cancelled order.')
+        if kind not in ('return', 'cancellation', 'billing_adjustment'):
+            raise BillingError('The pending refund request kind is invalid. Staff review is required.')
+        billed_lines(conn, order)
+        eligible = total - shipping if kind == 'return' else total
+        result['eligible_amount'] = str(eligible)
+        requested_items = _refund_items(details['items_json']) if details else []
+        if requested_items:
+            quote, current_items = return_quote(conn, order, requested_items)
+            result['eligible_amount'] = str(quote)
+            if (quote != refund or sorted(current_items, key=lambda item: item['item_code'])
+                    != sorted(requested_items, key=lambda item: item['item_code'])):
+                raise BillingError('Billed return details changed after the customer request. Staff review is required before approval.')
+        elif kind == 'return' and refund > eligible:
+            raise BillingError('Return refund exceeds merchandise and tax; shipping is nonrefundable.')
+        if kind == 'cancellation' and refund != total:
+            raise BillingError('Whole-order cancellation refund must equal the original cancelled invoice total.')
+        disposition = details['disposition'] if details else 'original_method'
+        if disposition not in ('original_method', 'store_credit'):
+            raise BillingError('The pending request has an unsupported refund destination.')
+        if disposition == 'original_method' and conn.execute(
+                "SELECT 1 FROM store_credit_ledger WHERE order_id=? AND kind='order_redemption'",
+                (order['order_id'],)).fetchone():
+            raise BillingError('This order used store credit. Its return must retain store_credit disposition.')
+        if details and details['target_order_id'] and disposition != 'store_credit':
+            raise BillingError('Only store credit can be linked to a cart.')
+        if details and details['target_order_id']:
+            target = conn.execute('SELECT customer_id FROM orders WHERE order_id=?', (details['target_order_id'],)).fetchone()
+            if not target or target['customer_id'] != order['customer_id']:
+                raise BillingError('The store credit target must belong to the same customer.')
+        if role == 'cashier':
+            limit = money(settings.CASHIER_REFUND_LIMIT)
+            if currency != settings.CASHIER_REFUND_CURRENCY or refund > limit:
+                raise BillingError(f'Admin approval required. Cashier limit is {limit} {settings.CASHIER_REFUND_CURRENCY}.')
+        if kind == 'return' and not (details and details['return_received']):
+            if waiver_reason:
+                if role != 'admin' or not isinstance(waiver_reason,str) or not 5 <= len(waiver_reason.strip()) <= 2000:
+                    raise BillingError('Only an admin can waive a return with a documented assessment reason.')
+            elif return_received is not True:
+                result['return_receipt_required'] = True
+        result['valid'] = True
+        result['ready_to_approve'] = not result['return_receipt_required']
+        if result['return_receipt_required']:
+            result['reasons'].append('Confirm physical return received, or ask admin for a documented return waiver.')
+    except (BillingError, ValueError, TypeError, ArithmeticError) as exc:
+        result['reasons'] = [str(exc) or 'The pending refund request needs staff review.']
+    return result
+
+
 def refund_status(order_id,customer_id,action,reason='',confirmed=False):
     if action=='escalate' and (confirmed is not True or not reason.strip() or len(reason)>2000):
         raise BillingError('Confirm escalation and provide a review reason of at most 2000 characters.')
     with transaction() as conn:
         order=order_row(conn,order_id,customer_id,allow_cancelled=True)
         request=conn.execute('SELECT * FROM refund_requests WHERE order_id=?',(order_id,)).fetchone()
-        if not request and order['refund_amount'] is None: raise BillingError('No refund request or recorded refund exists for this order.')
+        role = (scope.get() or {}).get('mode')
+        if not request and order['refund_amount'] is None and role not in ('admin','cashier'):
+            raise BillingError('No refund request or recorded refund exists for this order.')
         if action=='escalate':
             if not request: raise BillingError('This legacy refund needs manual staff review; no request reference is stored.')
             conn.execute('INSERT OR IGNORE INTO refund_details(order_id) VALUES (?)',(order_id,))
             conn.execute('UPDATE refund_details SET escalated_at=COALESCE(escalated_at,CURRENT_TIMESTAMP),escalation_note=? WHERE order_id=?',(reason.strip(),order_id))
         details=conn.execute('SELECT * FROM refund_details WHERE order_id=?',(order_id,)).fetchone()
-        return {'order_id':order_id,'order_status':order['order_status'],'local_status':request['status'] if request else 'legacy_recorded',
+        return {'order_id':order_id,'order_status':order['order_status'],'local_status':request['status'] if request else 'legacy_recorded' if order['refund_amount'] is not None else 'not_requested',
             'requested_amount':str(money(request['amount'])) if request else None,
             'recorded_amount':str(money(order['refund_amount'])) if order['refund_amount'] is not None else None,
             'approved_at':request['approved_at'] if request else None,
@@ -102,6 +197,7 @@ def refund_status(order_id,customer_id,action,reason='',confirmed=False):
             'request_kind':details['request_kind'] if details else None,
             'review_reference':f'REVIEW-{order_id}' if details and details['escalated_at'] else None,
             'escalated_at':details['escalated_at'] if details else None,
+            **({'approval_eligibility':refund_approval_check(conn,order,role)} if role in ('admin','cashier') else {}),
             'bank_status':'Not available. Local records do not verify funds sent or received.',
             'policy_estimate':'5-10 business days after staff handles an approved original-method refund.'}
 

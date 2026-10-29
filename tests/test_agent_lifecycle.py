@@ -1,3 +1,4 @@
+from address_support import place_order_with_address, prepare_delivery
 import asyncio
 import json
 
@@ -61,7 +62,7 @@ def test_reuse_fresh_data_and_separate_contexts(monkeypatch):
 
 def test_invoice_attachments_do_not_leak_between_turns(monkeypatch):
     order = request_order("CUST001", [{"item_code": "ITEM001", "quantity": 1}])
-    invoice = place_order(order["order_id"], "CUST001")["invoice_number"]
+    invoice = place_order_with_address(order["order_id"], "CUST001")["invoice_number"]
     replay = ReplayChatCompletionClient([
         tool_call("download_invoice", invoice_number=invoice, customer_id="CUST001"),
         "Your invoice is ready.", "Hello."])

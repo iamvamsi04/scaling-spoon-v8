@@ -33,7 +33,8 @@ from mcp_server.tools.billing_tools import money, price_for, totals, update_tota
 MAIN_COUNTS = {"customers": 400, "items": 400, "orders": 350,
                "order_requests": 450, "order_fulfilled": 400, "invoice_lines": 400}
 TABLES = (*MAIN_COUNTS, "price_history", "promotions", "billing_config", "order_details",
-          "product_details", "product_attributes", "product_relations", "billing_audit", "customer_credentials")
+          "product_details", "product_attributes", "product_relations", "billing_audit", "customer_credentials",
+          "customer_addresses", "order_delivery")
 MARKER = "billing_seed_v1"
 ENRICHMENT_MARKER = 'billing_seed_v2'
 PASSWORD_BATCH_SIZE = 25
@@ -170,6 +171,29 @@ def enrich(conn, as_of):
     seed_service_scenarios(conn,as_of,create_scenario_order)
     conn.execute('INSERT INTO billing_audit(action,details_json) VALUES (?,?)',('seed_enrichment',
         json.dumps({'generated':True,'as_of':as_of.isoformat(),'note':'Generated fixture records, not live customer transactions.'})))
+
+
+def seed_delivery_addresses(conn, include_orders=False):
+    """Saved address choices; drafts always require an explicit delivery selection."""
+    from database.addresses import address_snapshot
+    prefix = seed_layout(conn)[0]
+    customers = conn.execute('SELECT customer_id,name FROM customers WHERE customer_id GLOB ? ORDER BY customer_id',
+                             (prefix+'-CUST-*',)).fetchall()
+    for index, customer in enumerate(customers, 1):
+        for label in (('Home', 'Office') if index <= 100 else ('Home',)):
+            address_id = customer['customer_id'] + ('-HOME' if label == 'Home' else '-OFFICE')
+            conn.execute('''INSERT OR IGNORE INTO customer_addresses
+                (address_id,customer_id,label,full_name,phone,address_line1,city,state,postal_code,country,is_default)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                (address_id,customer['customer_id'],label,customer['name'],f'+1202555{index:04d}',
+                 f'{index} '+('Market Road' if label == 'Home' else 'Commerce Street'),
+                 'Springfield','Illinois','62701','US',int(label == 'Home')))
+    if include_orders:
+        for row in conn.execute('''SELECT a.*,o.order_id FROM orders o JOIN customer_addresses a
+            ON a.customer_id=o.customer_id AND a.is_default=1 AND a.active=1
+            WHERE o.order_status='placed' AND o.order_id GLOB ?''', (prefix+'-*',)).fetchall():
+            conn.execute('INSERT OR IGNORE INTO order_delivery VALUES (?,?,?,?)',
+                         (row['order_id'],row['customer_id'],row['address_id'],json.dumps(address_snapshot(row),sort_keys=True)))
 
 
 def audit_enrichment(conn):
@@ -343,12 +367,14 @@ def generate_records(db_path: Path, seed: int, as_of: date):
         if conn.execute("SELECT 1 FROM billing_config WHERE key=?", (enrichment_marker,)).fetchone():
             from database.service_seed import seed_service_scenarios
             seed_service_scenarios(conn,as_of,create_scenario_order)
+            seed_delivery_addresses(conn)
             result = {"status": "already_seeded", "database": str(db_path), "rows": counts(conn), 'scenarios':scenarios(conn), 'retired_records_backup':backup}
             conn.commit()
             return result
         if conn.execute("SELECT 1 FROM billing_config WHERE key=?", (marker,)).fetchone():
             before = counts(conn)
             enrich(conn,as_of)
+            seed_delivery_addresses(conn)
             audit_enrichment(conn)
             conn.execute('INSERT INTO billing_config VALUES (?,?)',(enrichment_marker,f'seed={seed};as_of={as_of.isoformat()}'))
             after = counts(conn)
@@ -446,6 +472,7 @@ def generate_records(db_path: Path, seed: int, as_of: date):
                     refund_counts[kind] += 1
         audit(conn, opening_stock)
         enrich(conn, as_of)
+        seed_delivery_addresses(conn, include_orders=True)
         audit_enrichment(conn)
         conn.execute("INSERT INTO billing_config(key,value) VALUES (?,?)", (marker, f"seed={seed};as_of={as_of.isoformat()}"))
         conn.execute("INSERT INTO billing_config(key,value) VALUES (?,?)", (enrichment_marker, f"seed={seed};as_of={as_of.isoformat()}"))

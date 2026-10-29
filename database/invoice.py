@@ -54,6 +54,9 @@ def generate_invoice(invoice_number, customer_id, *, connection=None):
         revision=conn.execute('SELECT id,contact_json FROM invoice_revisions WHERE order_id=? ORDER BY id DESC LIMIT 1',(order['order_id'],)).fetchone()
         if revision and document_type!='proforma': contact=json.loads(revision['contact_json'])
         credit=sum((money(-r[0]) for r in conn.execute("SELECT amount FROM store_credit_ledger WHERE order_id=? AND kind='order_redemption'",(order['order_id'],))),money(0))
+        delivery = conn.execute('SELECT address_snapshot FROM order_delivery WHERE order_id=? AND customer_id=?',
+                                (order['order_id'],customer_id)).fetchone()
+        delivery = json.loads(delivery[0]) if delivery else None
         if document_type=='tax' and not all(contact.get(k) for k in ('company','billing_address','tax_registration_number')):
             raise BillingError('Tax invoice needs company, billing address and tax registration number; record or correct them first.')
     finally:
@@ -71,6 +74,11 @@ def generate_invoice(invoice_number, customer_id, *, connection=None):
         if contact.get(field):
             story.append(p(("Tax registration: " if field=="tax_registration_number" else "")+str(contact[field])))
     if revision and document_type!='proforma': story.append(p(f"Billing details revision {revision['id']}"))
+    if delivery:
+        story.append(p('Delivery address', 'Heading3'))
+        for field in ('full_name','phone','address_line1','address_line2','city','state','postal_code','country','landmark'):
+            if delivery.get(field):
+                story.append(p(delivery[field]))
     if document_type=='proforma': story.append(p("Estimate for approval. Goods are not reserved; this is not an issued tax invoice."))
     story.append(p('Due date: ' + ((metadata['due_date'] if metadata else None) or 'Not recorded')))
     story.append(Spacer(1, 18))

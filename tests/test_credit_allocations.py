@@ -1,4 +1,5 @@
 """Credit remains consistent when an existing draft's invoice total changes."""
+from address_support import place_order_with_address, prepare_delivery
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -18,6 +19,7 @@ from mcp_server.tools.service_workflows import available_credit
 def draft(customer='CUST001'):
     result = request_order(customer, [{'item_code': 'ITEM001', 'quantity': 1}])
     assert result['ok'], result
+    prepare_delivery(result['order_id'], customer)
     return result['order_id']
 
 
@@ -28,7 +30,7 @@ def grant_credit(amount='50.00', customer='CUST001', currency='USD', target=None
         conn.execute("UPDATE billing_config SET value=? WHERE key='currency'", (currency,))
         conn.execute('UPDATE order_details SET currency=? WHERE order_id=?', (currency, source))
     try:
-        assert place_order(source, customer)['ok']
+        assert place_order_with_address(source, customer)['ok']
     finally:
         with transaction() as conn:
             conn.execute("UPDATE billing_config SET value=? WHERE key='currency'", (previous_currency,))
@@ -76,7 +78,7 @@ def test_basket_change_reconciles_credit_and_returns_current_quote(code, quantit
     assert snapshot['store_credit_requested'] == credit
     assert snapshot['remaining_invoice_amount'] == remaining
     assert balance() == Decimal('50.00')
-    placed = place_order(target, 'CUST001')
+    placed = place_order_with_address(target, 'CUST001')
     assert placed['ok'], placed
     assert placed['store_credit_applied'] == credit
     assert placed['remaining_invoice_amount'] == remaining
@@ -95,7 +97,7 @@ def test_coupon_clamps_existing_credit_before_checkout():
     assert result['charged_price'] == result['store_credit_requested'] == '71.91'
     assert result['remaining_invoice_amount'] == '0.00'
     assert allocation(target) == (Decimal('71.91'), Decimal('71.91'), 'SAVE10')
-    placed = place_order(target, 'CUST001')
+    placed = place_order_with_address(target, 'CUST001')
     assert placed['ok'], placed
     assert placed['store_credit_applied'] == '71.91'
     assert balance() == Decimal('7.99')
@@ -124,7 +126,7 @@ def test_zero_total_coupon_clears_credit_without_redeeming_it():
     assert result['ok'], result
     assert result['charged_price'] == result['store_credit_requested'] == '0.00'
     assert result['remaining_invoice_amount'] == '0.00'
-    placed = place_order(target, 'CUST001')
+    placed = place_order_with_address(target, 'CUST001')
     assert placed['ok'] and placed['store_credit_applied'] == '0.00'
     assert balance() == Decimal('50.00')
 
@@ -212,10 +214,10 @@ def test_placement_redeems_current_reservation_without_consuming_other_cart_cred
     grant_credit()
     first, second, third = draft(), draft(), draft()
     assert reserve(first, '30.00')['ok'] and reserve(second, '20.00')['ok']
-    assert place_order(first, 'CUST001')['ok']
+    assert place_order_with_address(first, 'CUST001')['ok']
     assert balance() == Decimal('20.00') and available() == 0
     assert not reserve(third, '0.01')['ok']
-    assert place_order(second, 'CUST001')['ok']
+    assert place_order_with_address(second, 'CUST001')['ok']
     assert balance() == available() == 0
 
 
@@ -233,13 +235,13 @@ def test_reservations_are_isolated_by_customer_and_normalized_currency():
     assert available(currency=' uSd ') == available(currency='EUR') == available('CUST002') == 0
     with transaction() as conn:
         conn.execute("UPDATE billing_config SET value=' eur ' WHERE key='currency'")
-    assert place_order(eur, 'CUST001')['ok']
+    assert place_order_with_address(eur, 'CUST001')['ok']
     with transaction() as conn:
         conn.execute("UPDATE billing_config SET value='USD' WHERE key='currency'")
-    assert place_order(other, 'CUST002')['ok']
+    assert place_order_with_address(other, 'CUST002')['ok']
     with transaction() as conn:
         conn.execute("UPDATE billing_config SET value=' UsD ' WHERE key='currency'")
-    assert place_order(usd, 'CUST001')['ok']
+    assert place_order_with_address(usd, 'CUST001')['ok']
 
 
 def test_reservation_currency_uses_same_fallback_for_missing_order_details():
@@ -259,10 +261,10 @@ def test_legacy_overallocated_drafts_cannot_redeem_another_carts_reservation():
     assert reserve(first, '50.00')['ok']
     with transaction() as conn:
         conn.execute('INSERT INTO order_service(order_id,credit_requested) VALUES (?,50)', (second,))
-    assert not place_order(first, 'CUST001')['ok']
+    assert not place_order_with_address(first, 'CUST001')['ok']
     assert balance() == Decimal('50.00')
     assert reserve(second, '0.00')['ok']
-    assert place_order(first, 'CUST001')['ok']
+    assert place_order_with_address(first, 'CUST001')['ok']
 
 
 def test_refund_target_allocation_respects_other_reservations_without_losing_refund():

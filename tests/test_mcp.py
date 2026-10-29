@@ -1,3 +1,4 @@
+from address_support import place_order_with_address, prepare_delivery
 import asyncio
 import json
 from autogen_ext.tools.mcp import McpWorkbench
@@ -21,7 +22,12 @@ def test_real_mcp_discovery_and_billing_flow():
                 return result
             assert (await call("execute_sql_query", query="SELECT COUNT(*) FROM customers"))["rows"] == [[1]]
             await call('manage_customer', customer_id='CUST001', name='Test shopper', action='update', confirmed=True)
+            from address_support import ADDRESS_FIELDS
+            address = await call('manage_customer', customer_id='CUST001', action='add_address',
+                                 address=ADDRESS_FIELDS, confirmed=True)
             order = await call("request_order", customer_id="CUST001", items=[{"item_code": "ITEM001", "quantity": 1}])
+            await call('manage_draft', order_id=order['order_id'], customer_id='CUST001',
+                       action='select_address', address_id=address['address_id'], confirmed=True)
             await call('manage_draft', order_id=order['order_id'], customer_id='CUST001', action='replace_items',
                        items=[{'item_code':'ITEM001','quantity':1}], confirmed=True)
             await call("apply_promotion", order_id=order["order_id"], customer_id="CUST001", promo_code="SAVE10", execution_coupon_codes=['SAVE10'])
@@ -57,7 +63,7 @@ def test_autogen_invoice_attachment(monkeypatch):
     from mcp_server.tools.billing_tools import request_order, place_order
     import agent.billing_agent as module
     order = request_order("CUST001", [{"item_code": "ITEM001", "quantity": 1}])
-    invoice = place_order(order["order_id"], "CUST001")["invoice_number"]
+    invoice = place_order_with_address(order["order_id"], "CUST001")["invoice_number"]
     replay = ReplayChatCompletionClient([
         CreateResult(finish_reason="function_calls", content=[FunctionCall(id="1", name="download_invoice", arguments=json.dumps({"invoice_number": invoice, "customer_id": "CUST001"}))], usage=RequestUsage(prompt_tokens=0, completion_tokens=0), cached=False),
         "Your invoice is ready."])

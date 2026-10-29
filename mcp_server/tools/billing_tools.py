@@ -189,7 +189,8 @@ def request_order(customer_id: str, items: list[dict], order_id: str | None = No
                      (order_id, currency[0] if currency else 'USD'))
     return {"order_id": order_id, "status": "draft", "order_status": "draft", "estimate": values,
             "currency": currency[0] if currency else 'USD',
-            "note": "Inventory is not reserved. Placement recalculates totals using order-date prices."}
+            'delivery_address_required': True,
+            "note": "Inventory is not reserved. Select a saved delivery address, then review and confirm checkout. Placement recalculates totals using order-date prices."}
 
 
 @tool_result
@@ -246,15 +247,33 @@ def apply_promotion(order_id: str | None, customer_id: str, promo_code: str, act
 
 
 @tool_result
-def place_order(order_id: str, customer_id: str) -> dict:
-    """Fulfill a confirmed draft atomically; repeat calls return the existing invoice."""
+def place_order(order_id: str, customer_id: str, expected_delivery: dict | None = None) -> dict:
+    """Fulfill a confirmed draft with an explicitly selected delivery address atomically.
+
+    Repeat calls return the existing invoice. expected_delivery binds the reviewed delivery terms.
+    """
+    # The trusted quote includes private delivery facts; audit only the address reference.
+    event = audit_context.get()
+    if event:
+        event['arguments'].pop('expected_delivery', None)
+        if isinstance(expected_delivery, dict):
+            event['arguments']['delivery_address_id'] = expected_delivery.get('address_id')
     with transaction() as conn:
         order = order_row(conn, order_id, customer_id)
         service=conn.execute('SELECT fulfillment_status FROM order_service WHERE order_id=?',(order_id,)).fetchone()
         if service and service[0]=='cancelled': raise BillingError('Order is cancelled. Create a new draft instead of placing it again.')
         if is_placed(conn, order):
+            from database.addresses import selected_address
+            delivery = selected_address(conn, order_id, customer_id)
             return {"order_id": order_id, "invoice_number": order["order_invoice"], "already_placed": True,
-                    'status': 'placed', 'order_status': 'placed'}
+                    'status': 'placed', 'order_status': 'placed', **(delivery or {})}
+        from database.addresses import selected_address
+        try:
+            delivery = selected_address(conn, order_id, customer_id, require_current=True)
+        except ValueError as exc:
+            raise BillingError(str(exc)) from exc
+        if expected_delivery is not None and expected_delivery != delivery:
+            raise BillingError('The reviewed delivery address changed. Review the current address and order, then confirm checkout again.')
         lines = lines_for(conn, order_id)
         if not lines:
             raise BillingError("Order has no requested items.")
@@ -297,7 +316,8 @@ def place_order(order_id: str, customer_id: str) -> dict:
         due_date = conn.execute('SELECT due_date FROM order_details WHERE order_id=?', (order_id,)).fetchone()[0]
     return {"order_id": order_id, "invoice_number": invoice, "status": "placed", 'order_status': 'placed', **values,
             "currency": currency[0] if currency else 'USD', 'due_date': due_date,
-            "store_credit_applied":str(redeemed),"remaining_invoice_amount":str(money(values["charged_price"])-redeemed)}
+            "store_credit_applied":str(redeemed),"remaining_invoice_amount":str(money(values["charged_price"])-redeemed),
+            **delivery}
 
 
 def check_return_window(conn, order):
@@ -343,7 +363,9 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
     bulk_request needs confirmed=true and reason and submits each eligible order for approval.
     For bulk actions pass order_id=''. No automatic staff approval occurs.
     action=quote estimates an item/full merchandise return without creating a request; reason may be blank.
-    action=status reads local status; escalate records a confirmed staff-review flag with reason.
+    action=status reads local status; staff also receive current approval eligibility and rejection reasons.
+    Before approval inspect eligibility; shipping on an invoice does not invalidate an otherwise eligible
+    merchandise return. Shipping itself is nonrefundable for returns. escalate records a confirmed review flag.
     items selects billed item_code/quantity; refund is computed with allocated discount/tax, excluding shipping.
     disposition=store_credit optionally links target_order_id to an owned draft.
     Approval requires return_received=true or an admin waiver_reason for physical returns.
@@ -393,6 +415,11 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
         raise BillingError('A refund reason of 1-2000 characters is required.')
     with transaction() as conn:
         order = order_row(conn, order_id, customer_id, allow_cancelled=True)
+        if action == 'approve':
+            from mcp_server.tools.service_workflows import refund_approval_check
+            eligibility = refund_approval_check(conn,order,role,return_received=return_received,waiver_reason=waiver_reason)
+            if not eligibility['ready_to_approve']:
+                raise BillingError(eligibility['reasons'][0])
         if not is_placed(conn, order):
             raise BillingError('Only placed orders can be refunded.')
         check_return_window(conn, order)
@@ -447,7 +474,7 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
             return {'order_id':order_id,'order_status':order['order_status'],'quoted_amount':str(refund),'currency':currency,'items':selected,
                     'basis':{'subtotal':str(money(order['subtotal'])),'discount':str(money(order['discount_applied'])),'tax':str(money(order['tax_amount'])),'nonrefundable_shipping':str(money(order['shipping_amount']))},
                     'note':'Estimate only. No refund request was created or approved.'}
-        if pending and (refund != money(pending['amount']) or currency != pending['currency']
+        if pending and (refund != money(pending['amount']) or currency != pending['currency'].strip().upper()
                         or reason.strip() != pending['reason']):
             raise BillingError('A request already exists. Approve its exact amount, currency and reason; do not replace it.')
         if action == 'approve' and role == 'cashier':

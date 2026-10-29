@@ -80,7 +80,9 @@ def customer_query_connection(customer_id, staff=False):
     # still let a model enumerate codes in follow-up queries.
     if staff:
         queries['promotions'] = 'SELECT * FROM promotions'
-    for table in ('order_requests','order_fulfilled','invoice_lines','order_details','refund_requests','refund_details','order_service','invoice_revisions'):
+    else:
+        queries['customer_addresses'] = 'SELECT * FROM customer_addresses WHERE customer_id=? AND active=1'
+    for table in ('order_requests','order_fulfilled','invoice_lines','order_details','refund_requests','refund_details','order_service','invoice_revisions','order_delivery'):
         queries[table] = f'SELECT t.* FROM {table} t JOIN orders o ON o.order_id=t.order_id WHERE o.customer_id=?'
     try:
         source.execute('BEGIN')

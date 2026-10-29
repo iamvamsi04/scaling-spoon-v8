@@ -4,6 +4,7 @@ The replay client controls only model decisions. Draft creation below uses the r
 MCP subprocess, scope wrapper, SQLite transactions and shopping-state observation.
 These checks do not claim to measure live Azure language understanding or latency.
 """
+from address_support import place_order_with_address, prepare_delivery
 import ast
 import asyncio
 from contextlib import closing
@@ -108,7 +109,7 @@ def test_refund_pending_request_threshold_and_window_remain_backend_rules(monkey
     monkeypatch.setattr(settings, 'CASHIER_REFUND_LIMIT', '100.00')
     monkeypatch.setattr(settings, 'RETURN_WINDOW_DAYS', '30')
     draft = request_order('CUST001', [{'item_code': 'ITEM001', 'quantity': 2}], order_id='RETURN-TERMS')
-    assert draft['ok'] and place_order(draft['order_id'], 'CUST001')['ok']
+    assert draft['ok'] and place_order_with_address(draft['order_id'], 'CUST001')['ok']
     refund = scoped_tool(process_refund)
     terms = dict(order_id=draft['order_id'], customer_id='CUST001', reason='Return', amount='120.00')
     no_request = refund(**terms, action='approve', confirmed=True, return_received=True, execution_mode='admin')

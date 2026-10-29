@@ -1,4 +1,5 @@
 """History limits preserve exact proposals and contiguous conversational turns."""
+from address_support import prepare_delivery
 from copy import deepcopy
 import asyncio
 import json
@@ -37,7 +38,7 @@ def test_never_skips_an_oversized_middle_turn_to_include_older_context():
 
 
 def test_utf8_budget_counts_multibyte_text_without_slicing():
-    older = turn(1, '界' * 100)
+    older = turn(1, 'ç•Œ' * 100)
     latest = turn(2)
     assert bounded_history(older + latest, max_bytes=300) == latest
     assert bounded_history(older + latest, max_bytes=1000) == older + latest
@@ -132,14 +133,16 @@ def test_customer_memory_and_exact_proposal_remain_available_after_history_budge
                  'items': [{'item_code': 'ITEM001', 'quantity': 1}]}
     draft = request_order(**arguments)
     assert draft['ok']
+    prepare_delivery(draft['order_id'], 'CUST001')
     tracker.observe('request_order', arguments, draft, 'CUST001')
     summary = 'Place one keyboard in order BUDGET-ORDER for the quoted 79.90 USD merchandise price?'
-    tracker.finish(json.dumps({'reply': summary, 'shopping_update': {
+    review = tracker.finish(json.dumps({'reply': summary, 'shopping_update': {
         'needs': ['Quiet office work'], 'quantity': 1,
         'budget': {'amount': '125.00', 'currency': 'USD', 'scope': 'all_in'},
         'pending_confirmation': {'action': 'place_order', 'order_id': 'BUDGET-ORDER', 'summary': summary}}}))
     assert tracker.state['pending_confirmation'] is not None
-    history = [message for number in range(20) for message in turn(number)] + turn('quote', summary)
+    saved_summary = tracker.state['pending_confirmation']['summary']
+    history = [message for number in range(20) for message in turn(number)] + turn('quote', review)
     replay = ReplayChatCompletionClient(['The existing quote is awaiting your decision.'])
     monkeypatch.setattr(module, 'create_model_client', lambda: replay)
 
@@ -155,10 +158,10 @@ def test_customer_memory_and_exact_proposal_remain_available_after_history_budge
             saved_memory = json.dumps(tracker.state, ensure_ascii=False, separators=(',', ':'))
             assert len(system) < 20000 + len(schema_hint('customer')) + len(BUSINESS_SCOPE) + len(saved_memory)
             assert 'Quiet office work' in system and '125.00' in system and 'all_in' in system
-            assert summary in system
+            assert saved_summary in system
             assert 'BUDGET-ORDER' in system and 'awaiting_customer' in system
             assert [message.content for message in sent[1:-1]] == [entry['content'] for entry in history[-8:]]
-            assert sent[-2].content == summary
+            assert sent[-2].content == review
             assert engine._workbench.tool_calls == 0
         finally:
             await engine.close()

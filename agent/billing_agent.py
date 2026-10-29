@@ -145,13 +145,19 @@ def change_receipt(name, arguments, data):
         return f'Coupon {arguments.get("promo_code")} was applied to order {target}.'
     if name == 'manage_customer' and action == 'update':
         return 'Your customer details were updated.'
+    if name == 'manage_customer' and action in ('add_address','update_address','delete_address','set_default_address'):
+        return {'add_address':'Your delivery address was saved.',
+                'update_address':'Your delivery address was updated.',
+                'delete_address':'Your saved delivery address was removed.',
+                'set_default_address':'Your default delivery address was updated.'}[action]
     if name == 'download_invoice' and action == 'correct_details':
         return f'Contact details on invoice {arguments.get("invoice_number")} were corrected.'
     if name == 'manage_draft':
         labels = {'replace_items':'had its draft items updated', 'cancel':'was cancelled',
             'apply_store_credit':'had its store credit reservation updated',
             'report_billing_issue':'had a billing review note recorded',
-            'ship':'was marked shipped', 'deliver':'was marked delivered'}
+            'ship':'was marked shipped', 'deliver':'was marked delivered',
+            'select_address':'had its delivery address selected; review the current quote before placement'}
         if action in labels:
             return f'Order {target} {labels[action]}.'
     if name == 'process_refund':
@@ -176,6 +182,8 @@ def customer_change(name, values):
             'report_billing_issue':'report_billing_issue'}.get(action)
     if name == 'manage_customer' and action == 'update':
         return 'update_customer'
+    if name == 'manage_customer' and action in ('add_address','update_address','delete_address','set_default_address'):
+        return action
     if name == 'process_refund':
         return {'request':'process_refund', 'escalate':'escalate_refund',
             'bulk_request':'bulk_refund'}.get(action or 'request')
@@ -199,10 +207,12 @@ def customer_terms_error(name, arguments, proposal):
     actions = {action, 'cancel_draft'} if action == 'cancel_order' else {action}
     if proposal.get('action') not in actions:
         return detail
-    order_id = None if action in ('update_customer','bulk_refund') else arguments.get('order_id')
+    order_id = None if action in ('update_customer','bulk_refund','add_address','update_address','delete_address','set_default_address') else arguments.get('order_id')
     if proposal.get('order_id') != order_id:
         return detail
-    bound = action not in ('place_order','cancel_order') or proposal.get('arguments') is not None or bool(arguments.get('reason'))
+    # Placement has no editable financial arguments. Its complete order and
+    # delivery terms are bound by the saved fingerprint, not model display data.
+    bound = action != 'place_order' and (action != 'cancel_order' or proposal.get('arguments') is not None or bool(arguments.get('reason')))
     try:
         current = canonical_proposal_arguments(arguments)
         if action == 'process_refund' and Decimal(current.get('amount','0')) <= 0:
@@ -218,7 +228,7 @@ def mutating_call(name, values):
     return (customer_change(name,values) is not None or name == 'request_order'
         or name == 'apply_promotion' and values.get('action','apply') == 'apply'
         or name == 'process_refund' and values.get('action') == 'approve'
-        or name == 'manage_draft' and values.get('action') in ('ship','deliver'))
+        or name == 'manage_draft' and values.get('action') in ('ship','deliver','select_address'))
 
 
 def blocked_action_reply(content, workbench, customer=False):
@@ -244,7 +254,9 @@ def blocked_action_reply(content, workbench, customer=False):
                 'report_billing_issue':'record a billing review note',
                 'escalate_refund':'record a refund review flag',
                 'bulk_refund':'submit the specified bulk refund requests',
-                'apply_promotion':'apply the specified coupon'}
+                'apply_promotion':'apply the specified coupon',
+                'add_address':'save your delivery address', 'update_address':'update your saved delivery address',
+                'delete_address':'remove your saved delivery address', 'set_default_address':'change your default delivery address'}
             target = proposed.get('order_id')
             summary = 'Please confirm that you want to ' + labels[proposed['action']]
             if target:
@@ -305,7 +317,24 @@ def staff_refund_arguments(arguments, snapshot):
     return values
 
 
-def staff_confirmation(content, mode='admin', customer_id=None):
+def staff_approval_error(arguments, mode):
+    """Check current recorded eligibility locally before dispatching approval."""
+    from mcp_server.tools.service_workflows import refund_approval_check
+    with closing(connect(readonly=True)) as conn:
+        conn.execute('BEGIN')
+        order = conn.execute('SELECT * FROM orders WHERE order_id=? AND customer_id=?',
+                             (arguments.get('order_id'), arguments.get('customer_id'))).fetchone()
+        if not order:
+            return 'No refund was approved. Order not found for this customer.'
+        eligibility = refund_approval_check(conn, order, mode,
+            return_received=arguments.get('return_received') is True,
+            waiver_reason=arguments.get('waiver_reason') or '')
+    if not eligibility['ready_to_approve']:
+        return 'No refund was approved. ' + ' '.join(eligibility['reasons'])
+    return None
+
+
+def staff_confirmation(content, mode='admin', customer_id=None, errors=None):
     """Bind a structured model proposal to DB facts; never parse visible prose."""
     envelope = reply_envelope(content)
     reply = plain_reply(content)
@@ -322,6 +351,13 @@ def staff_confirmation(content, mode='admin', customer_id=None):
         return reply, None
     arguments = {**proposed['arguments'],'action':action}
     request = snapshot.get('refund_request')
+    if action == 'approve':
+        problem = staff_approval_error({**arguments, 'order_id':order_id,
+                                       'customer_id':snapshot['customer_id']}, mode)
+        if problem:
+            if errors is not None:
+                errors.append(problem)
+            return problem, None
     if action in ('approve','escalate') and not request:
         return reply, None
     if action == 'approve':
@@ -533,21 +569,22 @@ class RecordingWorkbench(McpWorkbench):
                 action.pop('default',None)
                 parameters['required'] = list(dict.fromkeys([*parameters.get('required',[]),'action']))
             if schema['name'] == 'manage_customer':
-                schema['description'] = ('Update the signed-in customer after confirmation. '
-                    'Use action=update and preserve unchanged contact fields. Account registration uses the account form.')
+                schema['description'] = ('Update the signed-in customer or saved delivery addresses after confirmation. '
+                    'Use action=update with name for profile; address actions omit profile fields. add_address/update_address accept address fields, '
+                    'delete_address/set_default_address accept address_id. Account registration uses the account form.')
                 action = parameters.get('properties', {}).get('action', {})
                 action.pop('default', None)
-                action['enum'] = ['update']
+                action['enum'] = ['update','add_address','update_address','delete_address','set_default_address']
                 parameters['required'] = list(dict.fromkeys([*parameters.get('required', []), 'action']))
             if self.mode != 'admin' and schema['name'] == 'execute_sql_query':
                 schema['description'] = schema['description'].split('For requested admin visuals', 1)[0].rstrip()
                 parameters.get('properties', {}).pop('chart', None)
                 if 'required' in parameters:
                     parameters['required'] = [f for f in parameters['required'] if f != 'chart']
-            for field in (*SCOPE_FIELDS, 'confirmed'):
+            for field in (*SCOPE_FIELDS, 'confirmed', 'expected_delivery'):
                 parameters.get('properties', {}).pop(field, None)
             if 'required' in parameters:
-                parameters['required'] = [f for f in parameters['required'] if f not in (*SCOPE_FIELDS,'confirmed')]
+                parameters['required'] = [f for f in parameters['required'] if f not in (*SCOPE_FIELDS,'confirmed','expected_delivery')]
         return schemas
 
     async def stop(self):
@@ -598,6 +635,7 @@ class RecordingWorkbench(McpWorkbench):
             return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
                 'ok': False, 'error': 'This is a read-only retrieval turn. No billing change was executed.'}))])
         authorization = dict(arguments or {})
+        authorization.pop('expected_delivery', None)
         if self.mode in ('admin','cashier') and name in ('process_refund','manage_draft'):
             snapshot = staff_refund_snapshot(authorization.get('order_id'))
             if snapshot and self.customer_id and snapshot['customer_id'] != self.customer_id:
@@ -620,6 +658,10 @@ class RecordingWorkbench(McpWorkbench):
                     if authorization.get(key) is None or key == 'reason' and not authorization.get(key):
                         authorization[key] = deepcopy(value)
             if authorization.get('action') == 'approve':
+                problem = staff_approval_error(authorization, self.mode)
+                if problem:
+                    self.action_blocks.append(problem)
+                    return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':problem}))])
                 authorization = staff_refund_arguments(authorization, snapshot)
             if proposed:
                 try:
@@ -658,6 +700,13 @@ class RecordingWorkbench(McpWorkbench):
             if self.shopping_tracker is not None:
                 self.shopping_tracker.state['provided_coupon_codes'] = list(self.coupon_codes)
         arguments = authorization
+        if self.mode == 'customer' and name == 'place_order':
+            delivery = (self.action_proposal or {}).get('delivery')
+            if not isinstance(delivery, dict) or not delivery.get('delivery_address'):
+                detail = 'No change was executed. Select a delivery address and review the complete current order before confirming placement.'
+                self.action_blocks.append(detail)
+                return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':detail}))])
+            arguments = {**arguments, 'expected_delivery':deepcopy(delivery)}
         if any(schema['name'] == name and 'confirmed' in schema.get('parameters',{}).get('properties',{})
                for schema in (self._tool_schemas or [])):
             arguments = {**(arguments or {}), 'confirmed':bool(mutating_call(name, arguments or {}))}
@@ -694,6 +743,12 @@ class RecordingWorkbench(McpWorkbench):
             # One human approval authorizes one matching change, never a second
             # model-selected action later in the same turn.
             self.action_proposal = None
+        if data.get('ok') and self.mode == 'customer' and name == 'manage_draft' and authorization.get('action') == 'select_address':
+            current = order_snapshot(data.get('order_id'), self.customer_id)
+            if (not self.action_proposal or not current
+                    or self.action_proposal.get('order_id') != current['order_id']
+                    or self.action_proposal.get('order_fingerprint') != current['fingerprint']):
+                self.action_proposal = None
         if data.get('ok') and self.mode in ('admin','cashier') and name == 'process_refund' and arguments.get('action') == 'approve':
             self.action_proposal = None
         try:
@@ -990,7 +1045,7 @@ class BillingAgent:
                 review = None
                 if (mode in ('admin','cashier') and not workbench.completed_changes
                         and not (workbench.uncertain_change or workbench.completed_response_error or workbench.dispatch_problem)):
-                    review, staff_proposal = staff_confirmation(content,mode,customer_id)
+                    review, staff_proposal = staff_confirmation(content,mode,customer_id,workbench.action_blocks)
                 if workbench.action_blocks:
                     content = blocked_action_reply(content, workbench, tracker is not None)
                     if staff_proposal is not None:

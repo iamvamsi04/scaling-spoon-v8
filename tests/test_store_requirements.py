@@ -1,4 +1,5 @@
 """The 27 requested service scenarios plus financial and access boundaries."""
+from address_support import place_order_with_address, prepare_delivery
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -20,7 +21,8 @@ customer_read=scoped_tool(execute_sql_query)
 
 def order(qty=2,code='ITEM001',placed=True):
     oid=request_order('CUST001',[{'item_code':code,'quantity':qty}])['order_id']
-    if placed: assert place_order(oid,'CUST001')['ok']
+    prepare_delivery(oid, 'CUST001')
+    if placed: assert place_order_with_address(oid,'CUST001')['ok']
     return oid
 
 
@@ -72,7 +74,7 @@ def test_required_service_scenarios(case,monkeypatch):
         stock=scalar("SELECT availablequantity FROM items WHERE item_code='ITEM001'")
         assert manage_draft(oid,'CUST001','cancel',reason='Changed mind',confirmed=True)['already_cancelled']
         assert scalar("SELECT availablequantity FROM items WHERE item_code='ITEM001'")==stock
-        assert not place_order(oid,'CUST001')['ok']
+        assert not place_order_with_address(oid,'CUST001')['ok']
         result=refund(oid,'CUST001','Changed mind',action='approve',confirmed=True,execution_mode='admin')
         assert result['ok']
     elif case in (6,7):
@@ -94,7 +96,7 @@ def test_required_service_scenarios(case,monkeypatch):
         draft=order(qty=3,placed=False)
         with transaction() as conn:
             conn.execute("INSERT INTO promotions(promo_code,discount_type,discount_value,expires_on) VALUES ('B2G','flat',79.90,date('now','+1 day'))")
-        assert apply_promotion(draft,'CUST001','B2G')['ok'];assert place_order(draft,'CUST001')['ok']
+        assert apply_promotion(draft,'CUST001','B2G')['ok'];assert place_order_with_address(draft,'CUST001')['ok']
         assert request(draft,items=[{'item_code':'ITEM001','quantity':1}])['requested_amount']=='53.27'
     elif case==14:
         assert request(oid,items=[{'item_code':'ITEM001','quantity':1}])['ok']
@@ -112,8 +114,8 @@ def test_required_service_scenarios(case,monkeypatch):
         assert scalar('SELECT COUNT(*) FROM store_credit_ledger')==0
         assert approve(oid,return_received=True)['ok']
         assert scalar('SELECT credit_requested FROM order_service WHERE order_id=?',(draft,))==79.90
-        result=place_order(draft,'CUST001');assert result['ok'] and result['remaining_invoice_amount']=='0.00'
-        assert place_order(draft,'CUST001')['already_placed']
+        result=place_order_with_address(draft,'CUST001');assert result['ok'] and result['remaining_invoice_amount']=='0.00'
+        assert place_order_with_address(draft,'CUST001')['already_placed']
         assert scalar("SELECT COUNT(*) FROM store_credit_ledger WHERE kind='order_redemption'")==1
     elif case==17:
         with transaction() as conn: conn.execute("UPDATE items SET sellingprice=89.90 WHERE item_code='ITEM001'")
@@ -161,7 +163,7 @@ def test_credit_cannot_be_double_spent_across_drafts():
     drafts=[order(qty=1,placed=False),order(qty=1,placed=False)]
     assert manage_draft(drafts[0],'CUST001','apply_store_credit',credit_amount='79.90',confirmed=True)['ok']
     assert not manage_draft(drafts[1],'CUST001','apply_store_credit',credit_amount='79.90',confirmed=True)['ok']
-    with ThreadPoolExecutor(2) as pool: results=list(pool.map(lambda oid:place_order(oid,'CUST001'),drafts))
+    with ThreadPoolExecutor(2) as pool: results=list(pool.map(lambda oid:place_order_with_address(oid,'CUST001'),drafts))
     assert all(r['ok'] for r in results)
     assert sorted(Decimal(r['store_credit_applied']) for r in results)==[Decimal('0.00'),Decimal('79.90')]
     assert scalar('SELECT SUM(amount) FROM store_credit_ledger')==0
@@ -232,7 +234,7 @@ def test_new_invoice_pdf_content_and_revision_isolation(monkeypatch):
     draft=order(placed=False)
     assert download_invoice('','CUST001',document_type='proforma',order_id=draft)['ready']
     assert 'PRO FORMA INVOICE' in seen and 'Original Road' in seen
-    placed=place_order(draft,'CUST001');inv=placed['invoice_number']
+    placed=place_order_with_address(draft,'CUST001');inv=placed['invoice_number']
     assert download_invoice(inv,'CUST001',document_type='tax')['ready']
     assert 'TAX INVOICE' in seen and 'Tax registration: TAX-789' in seen
     seen.clear()

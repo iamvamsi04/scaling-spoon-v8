@@ -105,6 +105,9 @@ def clear_customer_session():
     for key in ('_customer_session_checked', '_customer_session_deadline',
                 '_customer_session_retry_after', '_customer_session_warning'):
         st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if key.startswith(('_address_', '_delivery_')):
+            st.session_state.pop(key, None)
 
 
 def reset_mode():
@@ -205,6 +208,7 @@ def customer_account(action):
         st.session_state.conversation_id = None
         st.session_state.messages = []
         st.session_state.pending = None
+        st.session_state.pop('_delivery_cache', None)
     except httpx.HTTPStatusError as exc:
         st.session_state.account_error = error_reply(exc.response)
     except httpx.HTTPError:
@@ -212,6 +216,141 @@ def customer_account(action):
     finally:
         st.session_state.customer_password = ''
         st.session_state.customer_password_repeat = ''
+
+
+ADDRESS_FIELDS = (
+    ('full_name', 'Full name *', 200), ('phone', 'Phone number *', 30),
+    ('address_line1', 'Address line 1 *', 200), ('address_line2', 'Address line 2', 200),
+    ('city', 'City *', 100), ('state', 'State / province / region *', 100),
+    ('postal_code', 'Postal code *', 20), ('country', 'Country code *', 2),
+    ('label', 'Address label', 50), ('landmark', 'Landmark', 200),
+)
+
+
+def address_label(address):
+    title = address.get('label') or address.get('full_name') or 'Saved address'
+    place = ', '.join(str(address.get(key) or '') for key in ('address_line1', 'city'))
+    return f"{title}: {place}" + (' (default)' if address.get('is_default') else '')
+
+
+def delivery_notice(operation, *args, **kwargs):
+    try:
+        operation(*args, **kwargs)
+        st.session_state.pop('_delivery_cache', None)
+        st.session_state['_delivery_notice'] = 'Saved. Review the selected delivery address with your order before confirming checkout.'
+        return True
+    except httpx.HTTPError as exc:
+        handle_expired_session(exc)
+        st.session_state['_delivery_error'] = (error_reply(exc.response)
+            if isinstance(exc, httpx.HTTPStatusError) else 'Unable to update delivery details. Please try again.')
+        return False
+
+
+def save_delivery_form(address_id):
+    prefix = '_address_form_' + (address_id or 'new') + '_'
+    fields = {key: st.session_state.get(prefix + key, '') for key, _, _ in ADDRESS_FIELDS}
+    fields['is_default'] = st.session_state.get(prefix + 'is_default', False)
+    route = '/customers/addresses' + ('/' + address_id if address_id else '')
+    if delivery_notice(request, 'PUT' if address_id else 'POST', route, json=fields) and not address_id:
+        for key in list(st.session_state):
+            if key.startswith(prefix):
+                st.session_state.pop(key, None)
+
+
+def delivery_addresses():
+    """The address form uses the signed-in account, separate from chat wording."""
+    with st.expander('Delivery addresses and checkout'):
+        if not st.session_state.get('_delivery_open'):
+            if not st.button('Manage and select delivery address', disabled=bool(st.session_state.pending)):
+                return
+            st.session_state['_delivery_open'] = True
+        st.caption('Fields marked * are required. Country code examples: IN, US. Optional fields have no *.')
+        cached = st.session_state.get('_delivery_cache')
+        owner = (API, st.session_state.customer_id)
+        try:
+            if not cached or cached[:2] != owner or monotonic() - cached[2] >= 15:
+                data = request('GET', '/customers/checkout').json()
+                cached = (*owner, monotonic(), data)
+                st.session_state['_delivery_cache'] = cached
+            data = cached[3]
+        except httpx.HTTPError as exc:
+            handle_expired_session(exc)
+            st.warning('Unable to load delivery addresses. Check the API connection.')
+            return
+        if st.session_state.pop('_delivery_notice', None):
+            st.success('Delivery details saved. Review your order before confirming checkout.')
+        error = st.session_state.pop('_delivery_error', None)
+        if error:
+            st.error(error)
+        addresses = {entry['address_id']: entry for entry in data.get('addresses', [])}
+        choices = [''] + list(addresses)
+        if st.session_state.get('_address_editor') not in choices:
+            st.session_state['_address_editor'] = ''
+        selected = st.selectbox('Address book', choices, key='_address_editor',
+            format_func=lambda value: address_label(addresses[value]) if value else 'Add a new address',
+            disabled=bool(st.session_state.pending))
+        address = addresses.get(selected, {})
+        prefix = '_address_form_' + (selected or 'new') + '_'
+        if selected:
+            signature = json.dumps(address, sort_keys=True)
+            if st.session_state.get('_address_loaded_' + selected) != signature:
+                for field, _, _ in ADDRESS_FIELDS:
+                    st.session_state[prefix + field] = address.get(field, '')
+                st.session_state[prefix + 'is_default'] = bool(address.get('is_default'))
+                st.session_state['_address_loaded_' + selected] = signature
+        with st.form('delivery_address_' + (selected or 'new')):
+            for field, label, maximum in ADDRESS_FIELDS:
+                st.session_state.setdefault(prefix + field, address.get(field, ''))
+                st.text_input(label, max_chars=maximum, key=prefix + field,
+                    disabled=bool(st.session_state.pending))
+            st.session_state.setdefault(prefix + 'is_default', bool(address.get('is_default')))
+            st.checkbox('Make this my default address', key=prefix + 'is_default',
+                disabled=bool(st.session_state.pending))
+            st.form_submit_button('Save address', on_click=save_delivery_form, args=(selected or None,),
+                disabled=bool(st.session_state.pending))
+        if selected:
+            if not address.get('is_default') and st.button('Use as default address', disabled=bool(st.session_state.pending)):
+                if delivery_notice(request, 'POST', '/customers/addresses/' + selected + '/default'):
+                    st.rerun()
+            remove = st.checkbox('Confirm deleting this saved address', key='_address_delete_' + selected,
+                disabled=bool(st.session_state.pending))
+            if st.button('Delete address', disabled=not remove or bool(st.session_state.pending)):
+                if delivery_notice(request, 'DELETE', '/customers/addresses/' + selected):
+                    st.rerun()
+        orders = {order['order_id']: order for order in data.get('orders', [])}
+        if not orders:
+            st.caption('Create an order draft in chat, then select its delivery address here.')
+            return
+        st.caption('Select a delivery address for each draft before asking to place the order.')
+        if st.session_state.get('_delivery_order') not in orders:
+            st.session_state.pop('_delivery_order', None)
+        order_id = st.selectbox('Order draft', list(orders), key='_delivery_order',
+            format_func=lambda value: f"{value} — {orders[value]['charged_price']} {orders[value]['currency']}",
+            disabled=bool(st.session_state.pending))
+        order = orders[order_id]
+        current = order.get('delivery_address')
+        if current:
+            st.caption('Selected for this order')
+            st.text('\n'.join(filter(None, [current.get('full_name'), current.get('phone'),
+                current.get('address_line1'), current.get('address_line2'),
+                ', '.join(str(current.get(key) or '') for key in ('city', 'state', 'postal_code', 'country')),
+                current.get('landmark')])))
+        else:
+            st.info('No delivery address selected for this draft.')
+        if addresses:
+            choice_key = '_delivery_choice_' + order_id
+            if st.session_state.get(choice_key) not in addresses:
+                st.session_state.pop(choice_key, None)
+            address_id = st.selectbox('Deliver this order to', list(addresses), index=None,
+                placeholder='Select an address', format_func=lambda value: address_label(addresses[value]),
+                key=choice_key, disabled=bool(st.session_state.pending))
+            if st.button('Use this delivery address', disabled=not address_id or bool(st.session_state.pending)):
+                if delivery_notice(request, 'PUT', f'/customers/orders/{order_id}/delivery-address',
+                                   json={'address_id': address_id}):
+                    st.rerun()
+        else:
+            st.info('Add an address above to continue checkout.')
+
 
 with st.sidebar:
     st.subheader("Store assistant")
@@ -259,6 +398,7 @@ with st.sidebar:
             st.button('Sign out', on_click=reset_mode)
             if st.session_state.get('_customer_session_warning'):
                 st.warning(st.session_state['_customer_session_warning'])
+            delivery_addresses()
         else:
             st.caption('Browse without signing in. Sign in for your orders, invoices and refunds.')
             with st.expander('Customer account'):
@@ -373,6 +513,7 @@ if st.session_state.pending:
             "invoices": reply.get("invoices", []), 'charts':reply.get('charts',[]),
             'tables':reply.get('tables',[]), 'reports':reply.get('reports',[])})
         st.session_state.pending = None
+        st.session_state.pop('_delivery_cache', None)
         st.rerun()
     except httpx.HTTPError as exc:
         handle_expired_session(exc)
