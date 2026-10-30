@@ -239,6 +239,17 @@ def blocked_action_reply(content, workbench, customer=False):
     visible = '\n'.join([*workbench.completed_changes, detail])
     envelope = reply_envelope(content) if customer else None
     update = envelope.get('shopping_update') if isinstance(envelope, dict) else None
+    if customer and workbench.checkout_review and not workbench.completed_changes:
+        # A model-selected placement without a saved approval is a request to
+        # review, never permission to write. Bind the next review to its actual
+        # tool target even if the final answer omitted the memory envelope.
+        try:
+            Proposal.model_validate(update.get('pending_confirmation') if isinstance(update, dict) else None)
+        except (ValueError, TypeError):
+            update = deepcopy(update) if isinstance(update, dict) else {}
+            update['pending_confirmation'] = {'action':'place_order',
+                'order_id':workbench.checkout_review, 'summary':'Review the current order before placement.'}
+            return json.dumps({'reply':visible, 'shopping_update':update})
     if isinstance(update, dict):
         update = deepcopy(update)
         proposal = update.get('pending_confirmation')
@@ -268,9 +279,8 @@ def blocked_action_reply(content, workbench, customer=False):
                 current = order_snapshot(target, workbench.customer_id)
                 if not current:
                     raise ValueError('Order is unavailable.')
-                basket = '; '.join(f"{row['quantity']} {row['name']} ({row['item_code']})" for row in current['items'])
-                totals = ', '.join(key.replace('_',' ') + ' ' + value for key,value in current['totals'].items())
-                summary += '\n' + basket + '\n' + totals + ' ' + current['currency'] + '.'
+                # ShoppingTracker renders the full saved quote and address;
+                # keeping this summary short also supports large valid baskets.
             proposed['summary'] = summary
             # Validate the generated review too; never truncate financial terms.
             proposed = Proposal.model_validate(proposed).model_dump(exclude_none=True)
@@ -403,6 +413,7 @@ class RecordingWorkbench(McpWorkbench):
         self.user_message = ''
         self.user_history = []
         self.action_proposal = None
+        self.checkout_review = None
         self.action_blocks = []
         self.completed_changes = []
         self.uncertain_change = False
@@ -686,6 +697,8 @@ class RecordingWorkbench(McpWorkbench):
                         self.action_proposal = None
         blocked = customer_terms_error(name, authorization, self.action_proposal) if self.mode == 'customer' else None
         if blocked:
+            if name == 'place_order':
+                self.checkout_review = authorization.get('order_id')
             self.action_blocks.append(blocked)
             return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
                 'ok': False, 'error': blocked, 'confirmation_required': True}))])
@@ -969,6 +982,7 @@ class BillingAgent:
                 workbench.reports.clear()
                 workbench.receipts.clear()
                 workbench.action_blocks.clear()
+                workbench.checkout_review = None
                 workbench.completed_changes.clear()
                 workbench.uncertain_change = False
                 workbench.completed_response_error = False
@@ -1070,6 +1084,20 @@ class BillingAgent:
                             if table not in workbench.tables:
                                 workbench.tables.append(table)
                 reply = tracker.finish(content) if tracker else plain_reply(content)
+                if tracker and not (workbench.action_blocks or workbench.uncertain_change
+                        or workbench.completed_response_error or workbench.dispatch_problem):
+                    placements = [change_receipt(name, args, data) for name, args, data in workbench.receipts
+                                  if name == 'place_order' and data.get('ok')]
+                    if placements:
+                        # A successful transaction has an authoritative receipt.
+                        # Free model prose must not ask to perform it again.
+                        reply = '\n'.join(placements)
+                        if workbench.failed:
+                            reply += '\n\nA tool failed during this request; some other requested results may be unavailable. The order placement above is confirmed.'
+                        review = tracker.confirmation_review()
+                        if review:
+                            reply += '\n\n' + review
+                        tracker.state['next_question'] = None
                 return {"response": reply, "invoices": list(workbench.downloads),
                         "charts": list(workbench.charts),
                         "tables": sanitize_tables(workbench.tables), "reports": list(workbench.reports),

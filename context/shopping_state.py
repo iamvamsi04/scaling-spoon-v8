@@ -185,7 +185,7 @@ def proposal_details(arguments):
 
 
 def order_snapshot(order_id, customer_id):
-    if not customer_id or not order_id:
+    if not isinstance(customer_id, str) or not customer_id or not isinstance(order_id, str) or not order_id:
         return None
     with closing(connect(readonly=True)) as conn:
         conn.execute('BEGIN')
@@ -249,8 +249,6 @@ class ShoppingTracker:
         draft = self.state['current_draft']
         if draft:
             current = order_snapshot(draft['order_id'], self.customer_id)
-            if not current or current['fingerprint'] != draft.get('fingerprint'):
-                self.state['pending_confirmation'] = None
             self.set_order(current)
         proposal = self.state['pending_confirmation']
         if proposal and proposal.get('order_id'):
@@ -351,18 +349,25 @@ class ShoppingTracker:
         update = parsed.model_dump(mode='json', exclude_unset=True)
         if parsed.budget is not None:
             update['budget'] = parsed.budget.model_dump(mode='json')
-        # Validate all product references before applying any preference changes.
-        allowed = {p['item_code'] for p in self.state['known_products']}
-        for key in ('selected_product_ids','displayed_product_ids','compared_product_ids'):
-            allowed.update(self.state[key])
-        for key in ('displayed_product_ids','selected_product_ids'):
-            if key in update and (len(set(update[key])) != len(update[key]) or not set(update[key]) <= allowed):
-                raise ValueError('Product selections must come from observed product results.')
         snapshot = None
         if update.get('active_draft_id'):
             snapshot = order_snapshot(update['active_draft_id'], self.customer_id)
             if not snapshot or snapshot['status'] != 'draft':
                 raise ValueError('Active draft must belong to the associated customer.')
+        proposed = update.get('pending_confirmation')
+        proposed_order = order_snapshot(proposed.get('order_id'), self.customer_id) if proposed else None
+        # An existing owned order is product evidence even in a brand-new chat.
+        # Load its saved lines before validating model-selected product references.
+        order_products = [item['item_code'] for order in
+                          (self.state['current_draft'], snapshot, proposed_order) if order
+                          for item in order['items']]
+        # Validate all product references before applying any preference changes.
+        allowed = {p['item_code'] for p in self.state['known_products']} | set(order_products)
+        for key in ('selected_product_ids','displayed_product_ids','compared_product_ids'):
+            allowed.update(self.state[key])
+        for key in ('displayed_product_ids','selected_product_ids'):
+            if key in update and (len(set(update[key])) != len(update[key]) or not set(update[key]) <= allowed):
+                raise ValueError('Product selections must come from observed product results.')
         features = {} if update.get('reset_preferences') else dict(self.state['preferred_features'])
         for key, value in update.get('preferred_features', {}).items():
             if value is None:
@@ -371,6 +376,7 @@ class ShoppingTracker:
                 features[key] = value
         if len(features) > 20:
             raise ValueError('Consolidate preferences before adding more than 20 features.')
+        self.remember_products(order_products)
         if update.get('reset_preferences'):
             for key in ('needs','budget','preferred_features','quantity','compared_product_ids',
                         'displayed_product_ids','selected_product_ids'):
@@ -384,10 +390,9 @@ class ShoppingTracker:
         if 'active_draft_id' in update:
             self.set_order(snapshot)
         self.state['next_question'] = update.get('next_question')
-        proposed = update.get('pending_confirmation')
         if proposed and (proposed['action'], proposed.get('order_id')) not in self.completed_actions:
             order_id = proposed.get('order_id')
-            order = order_snapshot(order_id, self.customer_id) if order_id else None
+            order = proposed_order
             action = proposed['action']
             account_action = action in ('update_customer','add_address','update_address','delete_address','set_default_address')
             bulk_action = action == 'bulk_refund'
@@ -445,19 +450,22 @@ class ShoppingTracker:
         update = deepcopy(envelope['shopping_update'])
         if isinstance(update, dict):
             proposal = update.get('pending_confirmation')
-            if (isinstance(proposal, dict) and proposal.get('action') == 'place_order'
-                    and ('place_order', proposal.get('order_id')) in self.completed_actions):
-                placed = order_snapshot(proposal.get('order_id'), self.customer_id)
-                if placed and placed['invoice_number']:
-                    reply = f"Order {placed['order_id']} was placed. Invoice {placed['invoice_number']} was issued."
-                    update['pending_confirmation'] = None
-                    if update.get('active_draft_id') == placed['order_id']:
-                        update['active_draft_id'] = None
             if isinstance(proposal, dict) and proposal.get('action') == 'place_order':
                 order = order_snapshot(proposal.get('order_id'), self.customer_id)
-                if order and order['status'] == 'draft' and not order['delivery_address']:
+                if not order or order['status'] != 'draft' or not order['delivery_address']:
                     update['pending_confirmation'] = None
-                    reply += '\n\nSelect a delivery address for this draft in Delivery addresses and checkout, then review the complete order before confirming placement.'
+                    if update.get('active_draft_id') == proposal.get('order_id'):
+                        update.pop('active_draft_id')
+                    if order:
+                        self.set_order(order)
+                    if order and order['status'] == 'placed' and order['invoice_number']:
+                        reply = f"Order {order['order_id']} was placed. Invoice {order['invoice_number']} was issued."
+                    elif order and order['status'] == 'cancelled':
+                        reply = 'No order was placed. This order is cancelled; create a new draft to purchase these items.'
+                    elif order and order['status'] == 'draft':
+                        reply = 'Select a delivery address for this draft in Delivery addresses and checkout, then review the complete order before confirming placement.'
+                    else:
+                        reply = 'No order was placed. This order is unavailable for this account.'
             if isinstance(proposal, dict) and isinstance(proposal.get('summary'), str):
                 proposal['summary'] = plain_reply(proposal['summary'])
             if isinstance(update.get('next_question'), str):
@@ -465,28 +473,46 @@ class ShoppingTracker:
         saved = deepcopy(self.state)
         try:
             self.apply_update(update, reply)
-            proposal = self.state.get('pending_confirmation')
-            if proposal and proposal['action'] == 'place_order':
-                reply = placement_review(self.state['current_draft'])[1]
-            elif proposal and proposal['summary'] not in reply:
-                # Presentation deduplication only: persistence never depends on
-                # matching the model's summary wording to its visible prose.
-                reply += '\n\n' + proposal['summary']
-            if proposal and proposal.get('arguments'):
-                details = proposal_details(proposal['arguments'])
-                reply += '\n\nDetails for approval:\n' + details
-            if proposal and proposal.get('action') == 'place_order':
-                delivery = (proposal.get('delivery') or {}).get('delivery_address')
-                if delivery:
-                    fields = (('full_name', 'Full name'), ('phone', 'Phone'),
-                              ('address_line1', 'Address line 1'), ('address_line2', 'Address line 2'),
-                              ('city', 'City'), ('state', 'State / province / region'),
-                              ('postal_code', 'Postal code'), ('country', 'Country'), ('landmark', 'Landmark'))
-                    lines = [f'{label}: {delivery[key]}' for key, label in fields if delivery.get(key)]
-                    reply += '\n\nDelivery address for approval:\n' + '\n'.join(lines)
         except (ValidationError, ValueError, TypeError):
             self.state = saved
+            # Invalid optional preferences must not discard a separately valid
+            # financial review. Revalidate that structured proposal on its own.
+            try:
+                self.apply_update({'pending_confirmation': update.get('pending_confirmation')}, reply)
+            except (ValidationError, ValueError, TypeError, AttributeError):
+                self.state = saved
             self.stage()
             log.warning('Invalid shopping update ignored; persisted facts and preferences retained.')
-            reply += '\n\nI could not save the updated shopping preferences for this reply. Please repeat any changed preferences next time.'
+            if not self.state.get('pending_confirmation'):
+                reply += '\n\nI could not save the updated shopping preferences for this reply. Please repeat any changed preferences next time.'
+        try:
+            return self.confirmation_review(reply)
+        except (ValueError, TypeError):
+            self.state['pending_confirmation'] = None
+            self.stage()
+            return 'The proposed details could not be displayed completely. Review a smaller change before confirming.'
+
+    def confirmation_review(self, reply=None):
+        """Render the saved proposal, optionally alongside a normal explanation."""
+        proposal = self.state.get('pending_confirmation')
+        if not proposal:
+            return reply or ''
+        if proposal['action'] == 'place_order':
+            reply = placement_review(self.state['current_draft'])[1]
+        elif reply is None:
+            reply = proposal['summary']
+        elif proposal['summary'] not in reply:
+            # Presentation deduplication only, never an approval decision.
+            reply += '\n\n' + proposal['summary']
+        if proposal.get('arguments'):
+            reply += '\n\nDetails for approval:\n' + proposal_details(proposal['arguments'])
+        if proposal['action'] == 'place_order':
+            delivery = (proposal.get('delivery') or {}).get('delivery_address')
+            if delivery:
+                fields = (('full_name', 'Full name'), ('phone', 'Phone'),
+                          ('address_line1', 'Address line 1'), ('address_line2', 'Address line 2'),
+                          ('city', 'City'), ('state', 'State / province / region'),
+                          ('postal_code', 'Postal code'), ('country', 'Country'), ('landmark', 'Landmark'))
+                lines = [f'{label}: {delivery[key]}' for key, label in fields if delivery.get(key)]
+                reply += '\n\nDelivery address for approval:\n' + '\n'.join(lines)
         return reply

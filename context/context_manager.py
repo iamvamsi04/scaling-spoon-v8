@@ -305,11 +305,44 @@ def begin(conversation_id, request_id, message, may_have_changed=True):
 def mark_request_changed(conversation_id, request_id):
     """Persist uncertainty before dispatching a change, never after its result."""
     with connection() as conn:
-        changed = conn.execute("UPDATE messages SET may_have_changed=1 WHERE conversation_id=? "
+        changed = conn.execute("UPDATE messages SET may_have_changed=1,response_json=NULL WHERE conversation_id=? "
                                "AND request_id=? AND role='user' AND status='pending'",
                                (conversation_id, request_id))
         if changed.rowcount != 1:
             raise ValueError('The billing change does not match an active request.')
+
+
+def customer_turn_state(conversation_id, request_id, customer_id):
+    """Expire global approval while retaining input for this request's safe retry.
+
+    begin() must first admit the request. It alone permits reopening a failed
+    read with the same message and no newer turn; pending or uncertain writes
+    cannot reach this input again. Never copy it into a different request.
+    """
+    from context.shopping_state import clear_confirmation, empty_state
+    with connection() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        record = conn.execute('''SELECT m.response_json FROM messages m
+            JOIN conversations c ON c.conversation_id=m.conversation_id
+            WHERE c.conversation_id=? AND c.mode='customer' AND c.customer_id IS ?
+              AND m.request_id=? AND m.role='user' AND m.status='pending' ''',
+            (conversation_id, customer_id, request_id)).fetchone()
+        if record is None:
+            raise ValueError('Shopping input does not match the active customer request.')
+        saved = json.loads(record['response_json']) if record['response_json'] else None
+        if isinstance(saved, dict) and set(saved) == {'shopping_input'} and isinstance(saved['shopping_input'], dict):
+            state = saved['shopping_input']
+        else:
+            row = conn.execute('SELECT state_json FROM shopping_states WHERE conversation_id=?',
+                               (conversation_id,)).fetchone()
+            defaults = empty_state()
+            current = json.loads(row[0]) if row else {}
+            state = {**defaults, **{key:value for key,value in current.items() if key in defaults}}
+            conn.execute("UPDATE messages SET response_json=? WHERE conversation_id=? "
+                         "AND request_id=? AND role='user' AND status='pending'",
+                         (json.dumps({'shopping_input':state}), conversation_id, request_id))
+        write_shopping_state(conn, conversation_id, clear_confirmation(state))
+        return state
 
 
 def finish(conversation_id, request_id, response):
@@ -326,9 +359,11 @@ def finish(conversation_id, request_id, response):
                      (conversation_id, request_id, response["response"]))
 
 
-def fail(conversation_id, request_id):
+def fail(conversation_id, request_id, before_execution=False):
     with connection() as conn:
-        conn.execute("UPDATE messages SET status='failed' WHERE conversation_id=? AND request_id=?", (conversation_id, request_id))
+        conn.execute("UPDATE messages SET status='failed',may_have_changed=CASE WHEN ? THEN 0 ELSE may_have_changed END "
+                     "WHERE conversation_id=? AND request_id=? AND role='user' AND status='pending'",
+                     (int(bool(before_execution)), conversation_id, request_id))
 
 
 def discard_pending(conversation_id, request_id):

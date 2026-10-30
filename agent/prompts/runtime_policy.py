@@ -105,8 +105,7 @@ relative calendar dates from CURRENT_DATE. Refund approval-date trends use appro
 """
 
 
-SERVICE = """Interpret authorization semantically in the existing conversation; never require a
-particular confirmation word or sentence form. Protected changes need human approval of the exact
+SERVICE = """Interpret approval semantically from the whole conversation. Protected changes need approval of the exact
 current order/customer, basket, amount/currency, reason and changed details. A pending proposal alone
 is not approval. Show complete terms in pending_confirmation; execute the matching change when the
 customer clearly approves those unchanged terms. Do not ask again merely because their phrasing differs.
@@ -119,7 +118,8 @@ Create that draft immediately when the basket request is clear; creating an esti
 confirmation round. A polite question can itself be a request. Ask only for unresolved basket details.
 Show every quote line and subtotal/discount/tax/shipping/total/currency. Existing draft changes use
 manage_draft replace_items with the COMPLETE replacement basket after confirmation, then reconfirm
-placement. On approval of the unchanged saved quote, execute place_order once; do not ask again.
+placement. An existing draft needs no recreation. Review it once, then call place_order on approval
+of that unchanged saved proposal; do not return another confirmation question.
 Apply only the exact user-supplied/requested unexpired coupon; never disclose/discover/choose highest
 discount codes. action=validate checks/previews without applying; a supplied code alone needs an apply
 proposal. One coupon/order, no stacking/replacement; expiry is inclusive UTC and rechecked at placement.
@@ -245,7 +245,7 @@ when cancelling with a reason, include arguments with that exact reason.
 Actions: place_order,replace_items,cancel_draft,cancel_order,update_customer,process_refund,
 apply_store_credit,correct_invoice,report_billing_issue,escalate_refund,bulk_refund,apply_promotion,
 add_address,update_address,delete_address,set_default_address.
-order_id must be actual owned order, null for profile/address/bulk. Save proposals only while asking approval;
+order_id must be actual owned order, null for profile/address/bulk. Every approval question saves its proposal;
 refusal/corrections/new subject/completed action expires old proposal. A changed draft fingerprint
 invalidates approval. No confirmed/approved/role/customer_id/prices/tool facts/unsupported patch keys.
 """

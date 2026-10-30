@@ -17,7 +17,6 @@ from context import context_manager as context
 from context.reply_text import plain_reply
 from context.tables import sanitize_tables
 from context.reports import sanitize_reports
-from context.shopping_state import clear_confirmation
 from database.connection import initialize as initialize_billing
 from database.connection import connect
 from database.invoice import invoice_path
@@ -402,19 +401,16 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x
         initial_shopping_state = None
         try:
             if record['mode'] == 'customer':
-                initial_shopping_state = context.shopping_state(cid)
-                if initial_shopping_state.get('pending_confirmation') or initial_shopping_state.get('next_question'):
-                    # Expire approval before any configuration/model/MCP failure
-                    # can hide this new human turn. Keep its original context for
-                    # evaluating the current reply, never a future unrelated yes.
-                    context.checkpoint_shopping(cid,rid,clear_confirmation(initial_shopping_state),record['customer_id'])
+                # Keep the original input only on this admitted request. A
+                # read-only retry gets its proposal back; new turns do not.
+                initial_shopping_state = context.customer_turn_state(cid, rid, record['customer_id'])
             validate = getattr(app.state.engine, "validate_configuration", None)
             if validate:
                 validate()
         except ValueError as exc:
-            # No tools have run. Remove this pending request so a configured restart
-            # can retry the same request ID safely.
-            context.discard_pending(cid, rid)
+            # No tools have run. Retain request-bound input for a same-ID retry,
+            # while its approval remains expired for any later customer turn.
+            context.fail(cid, rid, before_execution=True)
             raise HTTPException(503, str(exc)) from exc
         try:
             kwargs = {'mode': record['mode']} if record['mode'] in ('admin', 'cashier') else {}
