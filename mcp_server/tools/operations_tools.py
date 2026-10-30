@@ -115,14 +115,17 @@ def manage_customer(customer_id: str, name: str = '', company: str | None = None
 def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict] | None = None,
                  reason: str = '', confirmed: bool = False, credit_amount: str | None = None,
                  address_id: str | None = None) -> dict:
-    """After confirmation: replace_items edits drafts; cancel cancels drafts or whole unshipped issued orders.
+    """select_address stages an explicitly chosen saved address_id for an owned active draft.
+    It verifies address ownership/status itself; no prior lookup or separate approval is required for an exact ID.
+    Use it when checkout includes an address choice, then review the full quote/address for placement approval.
+    The sidebar is optional; selection does not place the order. Resolve ambiguous labels/drafts first.
+    After confirmation: replace_items edits drafts; cancel cancels drafts or whole unshipped issued orders.
     apply_store_credit allocates credit_amount to an owned draft; report_billing_issue stores reason for review.
     Authenticated admin only: ship/deliver update issued-order fulfillment status.
 
     items is the complete desired list of item_code and integer quantity. Issued invoice lines and totals are immutable.
     Cancellation retains records; only whole unshipped issued orders restore their fulfilled stock.
     Set credit_amount to zero to clear a draft's store-credit allocation.
-    select_address explicitly chooses an owned active saved address_id for a draft; this does not place it.
     """
     confirm(confirmed)
     from mcp_server.access import scope

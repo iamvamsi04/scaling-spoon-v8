@@ -286,13 +286,21 @@ async def health():
 
 @app.post("/conversations")
 async def create_conversation(body: ConversationRequest, x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None), x_customer_token: str | None = Header(default=None)):
+    customer_id = body.customer_id
     if body.mode == 'admin':
         require_admin(x_admin_key)
     elif body.mode == 'cashier':
         require_cashier(x_cashier_key, x_admin_key)
-    elif body.customer_id:
-        require_customer(body.customer_id, x_customer_token)
-    return {"conversation_id": context.conversation(customer_id=body.customer_id, mode=body.mode), 'mode': body.mode}
+    elif x_customer_token is not None:
+        # The verified session owns a new customer chat even when a client omits
+        # its redundant account ID. A supplied invalid token is never anonymous.
+        verified = customer_auth.customer_for_token(x_customer_token)
+        if not verified or customer_id is not None and customer_id != verified:
+            raise HTTPException(401, 'Sign in to the matching customer account.')
+        customer_id = verified
+    elif customer_id:
+        require_customer(customer_id, None)
+    return {"conversation_id": context.conversation(customer_id=customer_id, mode=body.mode), 'mode': body.mode}
 
 
 @app.get('/admin/access')

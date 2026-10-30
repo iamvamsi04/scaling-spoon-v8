@@ -463,7 +463,7 @@ class ShoppingTracker:
                     elif order and order['status'] == 'cancelled':
                         reply = 'No order was placed. This order is cancelled; create a new draft to purchase these items.'
                     elif order and order['status'] == 'draft':
-                        reply = 'Select a delivery address for this draft in Delivery addresses and checkout, then review the complete order before confirming placement.'
+                        reply = 'Choose a saved delivery address in chat by its address ID, or use Delivery addresses and checkout. Then review the complete order before confirming placement.'
                     else:
                         reply = 'No order was placed. This order is unavailable for this account.'
             if isinstance(proposal, dict) and isinstance(proposal.get('summary'), str):
