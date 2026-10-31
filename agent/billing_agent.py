@@ -32,6 +32,7 @@ from agent.table_presentation import tool_tables
 from context.context_manager import sanitize_analytics_context
 from context.tables import table_artifact, sanitize_tables
 from agent.model_history import bounded_history
+from observability import capture as telemetry
 
 
 log = logging.getLogger("uvicorn.error.billing_performance")
@@ -68,6 +69,7 @@ class TimedAzureClient(AzureOpenAIChatCompletionClient):
     """Measure SDK requests without logging prompts, identifiers or credentials."""
     async def create(self, *args, **kwargs):
         started = perf_counter()
+        provider_called = False
         try:
             workbench = getattr(self, 'batch_workbench', None)
             if workbench is not None and (workbench.uncertain_change or workbench.completed_response_error or workbench.dispatch_problem):
@@ -92,7 +94,14 @@ class TimedAzureClient(AzureOpenAIChatCompletionClient):
                 kwargs.pop('tool_choice', None)
             if extra:
                 kwargs['extra_create_args'] = extra
+            provider_called = True
             result = await super().create(*args, **kwargs)
+            provider_called = False
+            telemetry.model_call(perf_counter() - started,
+                input_tokens=getattr(getattr(result, 'usage', None), 'prompt_tokens', None),
+                output_tokens=getattr(getattr(result, 'usage', None), 'completion_tokens', None))
+            if result.finish_reason == 'content_filter':
+                telemetry.guardrail('provider_content_filter', 'blocked', 'provider_filtered')
             if workbench is not None:
                 workbench.prepare_batch(result.content)
             usage = result.usage
@@ -104,6 +113,8 @@ class TimedAzureClient(AzureOpenAIChatCompletionClient):
                      perf_counter() - started, usage.prompt_tokens, usage.completion_tokens)
             return result
         except BaseException:
+            if provider_called:
+                telemetry.model_call(perf_counter() - started, failed=True)
             log.info("billing_model seconds=%.3f status=failed", perf_counter() - started)
             raise
 
@@ -229,6 +240,14 @@ def mutating_call(name, values):
         or name == 'apply_promotion' and values.get('action','apply') == 'apply'
         or name == 'process_refund' and values.get('action') == 'approve'
         or name == 'manage_draft' and values.get('action') in ('ship','deliver','select_address'))
+
+
+def observed_mutation(name, values):
+    """Malformed metadata must not change the existing tool-rejection path."""
+    try:
+        return mutating_call(name, values)
+    except Exception:
+        return False
 
 
 def blocked_action_reply(content, workbench, customer=False):
@@ -604,9 +623,13 @@ class RecordingWorkbench(McpWorkbench):
 
     async def call_tool(self, name, arguments=None, cancellation_token=None, **kwargs):
         if arguments is not None and not isinstance(arguments, dict):
+            telemetry.guardrail('tool_arguments', 'blocked', 'object_required')
+            telemetry.tool_blocked(name, mutating=observed_mutation(name, {}))
             return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
                 'ok':False,'error':'Tool arguments must be an object. No tool was executed.'}))])
         if self._batch_blocked:
+            telemetry.guardrail('tool_batch', 'blocked', 'unsafe_parallel_changes')
+            telemetry.tool_blocked(name, mutating=observed_mutation(name, arguments or {}))
             return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
                 'ok': False, 'error': 'No tools in this batch were executed. Request writes and '
                 'invoice generation one at a time. Only independent read-only tools may be batched.'}))])
@@ -615,13 +638,18 @@ class RecordingWorkbench(McpWorkbench):
         # fewer model round trips, not concurrent database access.
         async with self._dispatch_lock:
             completed_before = len(self.completed_changes)
+            calls_before = self.tool_calls
             try:
-                return await self._call_tool(name, arguments, cancellation_token, **kwargs)
+                result = await self._call_tool(name, arguments, cancellation_token, **kwargs)
+                if self.tool_calls == calls_before and result.is_error:
+                    telemetry.tool_blocked(name, mutating=observed_mutation(name, arguments or {}))
+                return result
             except Exception:
                 # AutoGen's workbench event loop can otherwise wait for an event
                 # that a failed dispatch never publishes. Cancellation must still
                 # propagate, and an interrupted write must never be replayed.
                 log.exception('billing_tool_dispatch_failed tool=%s',name)
+                telemetry.guardrail('tool_dispatch', 'error', 'internal_dispatch_error')
                 self.failed = self.transport_failed = True
                 self.dispatch_problem = 'An internal tool error prevented a reliable result. No automatic retry was performed.'
                 values = arguments or {}
@@ -643,6 +671,7 @@ class RecordingWorkbench(McpWorkbench):
 
     async def _call_tool(self, name, arguments=None, cancellation_token=None, **kwargs):
         if self.repair_only and name not in READ_TOOLS:
+            telemetry.guardrail('read_only_recovery', 'blocked', 'change_not_allowed')
             return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
                 'ok': False, 'error': 'This is a read-only retrieval turn. No billing change was executed.'}))])
         authorization = dict(arguments or {})
@@ -650,6 +679,7 @@ class RecordingWorkbench(McpWorkbench):
         if self.mode in ('admin','cashier') and name in ('process_refund','manage_draft'):
             snapshot = staff_refund_snapshot(authorization.get('order_id'))
             if snapshot and self.customer_id and snapshot['customer_id'] != self.customer_id:
+                telemetry.guardrail('order_ownership', 'blocked', 'selected_owner_mismatch')
                 detail = 'No change was executed. This order does not belong to the selected customer.'
                 self.action_blocks.append(detail)
                 return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':detail}))])
@@ -659,6 +689,7 @@ class RecordingWorkbench(McpWorkbench):
             if proposed and (not snapshot or proposed.get('order_id') != authorization.get('order_id')
                     or proposed.get('action') != authorization.get('action')
                     or snapshot['fingerprint'] != proposed.get('order_fingerprint')):
+                telemetry.guardrail('approval_terms', 'blocked', 'stale_staff_terms')
                 detail = 'No change was executed. The reviewed order or refund terms changed. Review the current terms and obtain fresh approval.'
                 self.action_blocks.append(detail)
                 return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':detail}))])
@@ -671,8 +702,10 @@ class RecordingWorkbench(McpWorkbench):
             if authorization.get('action') == 'approve':
                 problem = staff_approval_error(authorization, self.mode)
                 if problem:
+                    telemetry.guardrail('refund_eligibility', 'blocked', 'request_not_eligible')
                     self.action_blocks.append(problem)
                     return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':problem}))])
+                telemetry.guardrail('refund_eligibility', 'pass', 'current_request_eligible')
                 authorization = staff_refund_arguments(authorization, snapshot)
             if proposed:
                 try:
@@ -681,9 +714,11 @@ class RecordingWorkbench(McpWorkbench):
                 except (ValueError, TypeError, KeyError):
                     matched = False
                 if not matched:
+                    telemetry.guardrail('approval_terms', 'blocked', 'staff_arguments_changed')
                     detail = 'No change was executed. The tool arguments differ from the reviewed terms. Review the revised terms before approval.'
                     self.action_blocks.append(detail)
                     return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':detail}))])
+                telemetry.guardrail('approval_terms', 'pass', 'saved_staff_terms_match')
         if self.mode == 'customer' and customer_change(name, authorization):
             proposal = self.action_proposal
             if proposal and proposal.get('order_id'):
@@ -697,18 +732,23 @@ class RecordingWorkbench(McpWorkbench):
                         self.action_proposal = None
         blocked = customer_terms_error(name, authorization, self.action_proposal) if self.mode == 'customer' else None
         if blocked:
+            telemetry.guardrail('approval_terms', 'blocked', 'customer_terms_unavailable_or_changed')
             if name == 'place_order':
                 self.checkout_review = authorization.get('order_id')
             self.action_blocks.append(blocked)
             return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
                 'ok': False, 'error': blocked, 'confirmation_required': True}))])
+        if self.mode == 'customer' and customer_change(name, authorization):
+            telemetry.guardrail('approval_terms', 'pass', 'saved_customer_terms_match')
         if self.mode == 'customer' and name == 'apply_promotion':
             code = authorization.get('promo_code')
             if not customer_supplied_coupon(code, self.user_message, self.user_history, self.coupon_codes):
+                telemetry.guardrail('coupon_provenance', 'blocked', 'customer_code_required')
                 detail = 'The customer must supply the exact coupon code before it can be checked or applied. No discount changed.'
                 self.action_blocks.append(detail)
                 return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
                     'ok': False, 'error':detail}))])
+            telemetry.guardrail('coupon_provenance', 'pass', 'customer_supplied_code')
             self.coupon_codes = list(dict.fromkeys([*self.coupon_codes, code.strip().upper()]))[-30:]
             if self.shopping_tracker is not None:
                 self.shopping_tracker.state['provided_coupon_codes'] = list(self.coupon_codes)
@@ -716,9 +756,11 @@ class RecordingWorkbench(McpWorkbench):
         if self.mode == 'customer' and name == 'place_order':
             delivery = (self.action_proposal or {}).get('delivery')
             if not isinstance(delivery, dict) or not delivery.get('delivery_address'):
+                telemetry.guardrail('delivery_selection', 'blocked', 'saved_review_missing')
                 detail = 'No change was executed. Select a delivery address and review the complete current order before confirming placement.'
                 self.action_blocks.append(detail)
                 return ToolResult(name=name,is_error=True,result=[TextResultContent(content=json.dumps({'ok':False,'error':detail}))])
+            telemetry.guardrail('delivery_selection', 'pass', 'saved_delivery_review')
             arguments = {**arguments, 'expected_delivery':deepcopy(delivery)}
         if any(schema['name'] == name and 'confirmed' in schema.get('parameters',{}).get('properties',{})
                for schema in (self._tool_schemas or [])):
@@ -728,21 +770,36 @@ class RecordingWorkbench(McpWorkbench):
                      'execution_customer_id': self.customer_id,
                      'execution_coupon_codes': list(self.coupon_codes)}
         started = perf_counter()
+        result = None
+        dispatched = False
         try:
             if mutating_call(name, authorization) and self.mutation_callback and not self._change_recorded:
-                self.mutation_callback()
+                try:
+                    self.mutation_callback()
+                except Exception:
+                    telemetry.guardrail('write_checkpoint', 'error', 'checkpoint_failed')
+                    raise
+                telemetry.guardrail('write_checkpoint', 'pass', 'marked_before_write')
                 self._change_recorded = True
+            dispatched = True
             result = await super().call_tool(name, arguments, cancellation_token, **kwargs)
         finally:
             elapsed = perf_counter() - started
             self.tool_seconds += elapsed
             self.tool_calls += 1
+            if dispatched and result is None:
+                telemetry.tool_call(name, elapsed, outcome='error', mutating=observed_mutation(name, authorization))
             log.info("billing_tool tool=%s seconds=%.3f", name, elapsed)
         self.failed = self.failed or result.is_error
         # A later completed MCP call proves the channel recovered. Keep the
         # turn's error history, but do not cold-start healthy transports again.
         self.transport_failed = bool(result.is_error)
         data = decode_result(result)
+        telemetry.tool_call(name, elapsed,
+            outcome='error' if result.is_error else 'success' if data.get('ok') else 'rejected',
+            mutating=observed_mutation(name, authorization))
+        telemetry.guardrail('tool_validation', 'error' if result.is_error else 'pass' if data.get('ok') else 'blocked',
+                            'transport_error' if result.is_error else 'backend_accepted' if data.get('ok') else 'backend_rejected')
         if result.is_error and mutating_call(name, authorization):
             self.uncertain_change = self.repair_only = True
         if not data.get('ok') and not result.is_error and mutating_call(name, authorization):

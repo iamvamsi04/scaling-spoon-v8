@@ -371,6 +371,7 @@ with st.sidebar:
             st.info('Enter the separate admin key to view store-wide analytics and records.')
             st.stop()
         st.button('Log out of admin mode', on_click=logout)
+        st.page_link('pages/1_Observability.py', label='Observability')
     elif st.session_state.mode == 'Cashier':
         st.caption('Records and limited refund approvals')
         if not st.session_state.cashier_key:

@@ -21,6 +21,8 @@ from database.connection import initialize as initialize_billing
 from database.connection import connect
 from database.invoice import invoice_path
 from api import customer_auth
+from observability import capture as telemetry
+from observability.api import create_router as observability_router
 
 log = logging.getLogger(__name__)
 
@@ -75,13 +77,21 @@ def require_customer(customer_id, token):
 
 def check_record(record, admin_key, cashier_key=None, customer_token=None):
     if not record:
+        telemetry.guardrail('account_access', 'blocked', 'conversation_unavailable')
         raise HTTPException(404, 'Conversation not found.')
-    if record['mode'] == 'admin':
-        require_admin(admin_key)
-    elif record['mode'] == 'cashier':
-        require_cashier(cashier_key, admin_key)
-    elif record['customer_id']:
-        require_customer(record['customer_id'], customer_token)
+    telemetry.identify(mode=record['mode'])
+    try:
+        if record['mode'] == 'admin':
+            require_admin(admin_key)
+        elif record['mode'] == 'cashier':
+            require_cashier(cashier_key, admin_key)
+        elif record['customer_id']:
+            require_customer(record['customer_id'], customer_token)
+    except HTTPException:
+        telemetry.guardrail('account_access', 'blocked', 'credentials_rejected')
+        raise
+    telemetry.guardrail('account_access', 'pass',
+                        'public_scope' if record['mode']=='customer' and not record['customer_id'] else 'verified_scope')
 
 
 @asynccontextmanager
@@ -94,17 +104,23 @@ async def lifespan(app):
         app.state.engine = BillingAgent()
     start = getattr(app.state.engine, "start", None)
     close = getattr(app.state.engine, "close", None)
+    telemetry.start()
     try:
         if start:
             await start()
         yield
     finally:
-        if close:
-            await close()
+        try:
+            if close:
+                await close()
+        finally:
+            telemetry.stop()
 
 
 app = FastAPI(title="Billing Agent", version="7.0.0", lifespan=lifespan,
               dependencies=[Depends(authorize)])
+app.add_middleware(telemetry.ObservabilityMiddleware)
+app.include_router(observability_router(require_admin))
 
 
 @app.exception_handler(RequestValidationError)
@@ -379,9 +395,11 @@ def cached_chat_response(cached):
     return {**cached, 'response': plain_reply(cached['response'])}
 
 
+@telemetry.observe_chat
 async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x_customer_token=None):
     cid, rid = str(body.conversation_id), str(body.request_id)
     if not body.message.strip():
+        telemetry.guardrail('request_validation', 'blocked', 'blank_message')
         raise HTTPException(422, "Message must not be blank.")
     check_record(context.get_conversation(cid), x_admin_key, x_cashier_key, x_customer_token)
     # A finished response is immutable. Serve an authorized retry immediately
@@ -389,12 +407,16 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x
     try:
         cached = context.completed_response(cid, rid, body.message)
     except ValueError as exc:
+        telemetry.guardrail('request_consistency', 'blocked', 'request_id_conflict')
         raise HTTPException(409, str(exc)) from exc
     if cached:
+        telemetry.cache_hit()
         return cached_chat_response(cached)
     # One worker and one active turn: no mutable agent state is shared across users.
     queued = perf_counter()
+    telemetry.queue_started()
     async with app.state.chat_lock:
+        telemetry.queue_finished()
         logging.getLogger("uvicorn.error.billing_performance").info(
             "billing_api queue_wait_seconds=%.3f", perf_counter() - queued)
         record = context.get_conversation(cid)
@@ -403,9 +425,12 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x
             tracks_changes = getattr(app.state.engine, 'supports_request_progress', False) is True
             cached = context.begin(cid, rid, body.message, may_have_changed=not tracks_changes)
         except ValueError as exc:
+            telemetry.guardrail('request_consistency', 'blocked', 'request_not_retryable')
             raise HTTPException(409, str(exc)) from exc
         if cached:
+            telemetry.cache_hit()
             return cached_chat_response(cached)
+        telemetry.guardrail('request_consistency', 'pass', 'request_admitted')
         initial_shopping_state = None
         try:
             if record['mode'] == 'customer':
@@ -433,8 +458,9 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x
             if record['mode'] == 'customer':
                 kwargs.update(shopping_state=initial_shopping_state,
                     state_callback=lambda state, owner: context.checkpoint_shopping(cid, rid, state, owner))
-            result = await asyncio.wait_for(app.state.engine.chat(body.message, context.history(cid), record["customer_id"], **kwargs),
-                                            timeout=settings.CHAT_TIMEOUT)
+            result = await telemetry.agent_call(asyncio.wait_for(
+                app.state.engine.chat(body.message, context.history(cid), record["customer_id"], **kwargs),
+                timeout=settings.CHAT_TIMEOUT))
             result["response"] = plain_reply(result["response"])
             if 'tables' in result:
                 result['tables'] = sanitize_tables(result['tables'])
