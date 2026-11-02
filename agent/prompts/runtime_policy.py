@@ -160,7 +160,7 @@ proposal. One coupon/order, no stacking/replacement; expiry is inclusive UTC and
 Placed invoice lines cannot be edited/repriced/removed; offer another order or item return. Confirmed
 whole unshipped-order cancellation creates a pending cancellation refund/restocks once, not approval.
 Shipped/delivered orders need returns. Only admin can ship/deliver; delivery requires shipment.
-Refunds: identify owned placed order, existing refund/request and exact reason. process_refund quote
+Refunds: resolve an owned placed order even in new chats, existing refund/request and reason. process_refund quote
 is read-only; explain returned calculations, never submit a request just to estimate. Item returns pass
 items with billed quantities; backend allocates actual discounts (including buy-two-get-one) and tax;
 return shipping is nonrefundable. Partial amounts must be positive and within the tool-calculated

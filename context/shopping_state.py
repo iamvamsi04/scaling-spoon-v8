@@ -157,6 +157,71 @@ def canonical_proposal_arguments(arguments):
     return values
 
 
+def canonical_refund_arguments(arguments):
+    """Compare request terms using the refund tool's structured defaults."""
+    values = canonical_proposal_arguments({} if arguments is None else arguments)
+    for key, default in (('return_received', False), ('waiver_reason', '')):
+        if key in values:
+            if type(values[key]) is not type(default) or values.pop(key) != default:
+                raise ValueError('A customer refund request cannot attest to a return receipt or staff waiver.')
+    if set(values) - {'reason', 'amount', 'items', 'disposition', 'target_order_id'}:
+        raise ValueError('A single refund request needs only its amount, reason, returned items and destination.')
+    reason = values.get('reason')
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+        raise ValueError('Provide the refund reason before reviewing the request.')
+    values['reason'] = reason.strip()
+    values.setdefault('disposition', 'original_method')
+    if values['disposition'] not in ('original_method', 'store_credit'):
+        raise ValueError('Choose original_method or store_credit for the refund request.')
+    if 'items' in values:
+        items = values['items']
+        if not isinstance(items, list) or not 1 <= len(items) <= 100 or any(
+                not isinstance(item, dict) or not isinstance(item.get('item_code'), str)
+                or type(item.get('quantity')) is not int or item['quantity'] <= 0 for item in items):
+            raise ValueError('Select returned items with positive integer quantities.')
+        if len({item['item_code'] for item in items}) != len(items):
+            raise ValueError('Return item codes must be unique.')
+        # Quote results contain display calculations; only these two fields are
+        # accepted as item selection by the existing refund calculator.
+        values['items'] = sorted(({'item_code': item['item_code'], 'quantity': item['quantity']}
+                                  for item in items), key=lambda item: item['item_code'])
+    return values
+
+
+class RefundReviewError(ValueError):
+    pass
+
+
+def refund_request_review(order, customer_id, arguments):
+    """Validate a review with the existing quote path; never submit or approve."""
+    try:
+        if not order:
+            raise ValueError('This order is unavailable for this account.')
+        existing = order['refund_request']
+        if existing:
+            raise ValueError(f"Order {order['order_id']} already has a {existing['status']} refund request. Check its status instead of submitting another request.")
+        if order['refund']['refund_amount'] is not None or order['refund']['refund_status']:
+            raise ValueError('A refund is already recorded for this order; another request cannot be submitted.')
+        values = canonical_refund_arguments(arguments)
+        from mcp_server.access import scoped_tool
+        from mcp_server.tools.billing_tools import process_refund
+        quote = scoped_tool(process_refund)(order_id=order['order_id'], customer_id=customer_id,
+            action='quote', execution_customer_id=customer_id, **values)
+        if not quote.get('ok'):
+            raise ValueError(quote['error'])
+        if 'amount' not in values and 'items' not in values:
+            values['items'] = [{'item_code': item['item_code'], 'quantity': item['quantity']}
+                               for item in quote['items']]
+        values['amount'] = quote['quoted_amount']
+        values = canonical_refund_arguments(values)
+        summary = (f"Please confirm a refund request for order {order['order_id']} for "
+            f"{quote['currency']} {values['amount']}. This submits a pending request for staff approval; "
+            'it does not approve or transfer a refund.')
+        return values, summary
+    except (ValueError, TypeError) as exc:
+        raise RefundReviewError(str(exc)) from exc
+
+
 def proposal_details(arguments):
     """Display validated proposal values without interpreting conversational text."""
     values = canonical_proposal_arguments(arguments)
@@ -404,6 +469,8 @@ class ShoppingTracker:
             elif action == 'cancel_order':
                 eligible = eligible and order['fulfillment_status'] == 'placed' and not order['refund_request'] and order['refund']['refund_amount'] is None
             elif action == 'process_refund':
+                proposed['arguments'], proposed['summary'] = refund_request_review(
+                    order, self.customer_id, proposed.get('arguments'))
                 eligible = eligible and not order['refund_request'] and order['refund']['refund_amount'] is None
             elif action == 'correct_invoice':
                 eligible = eligible and bool(order['invoice_number'])
@@ -473,12 +540,20 @@ class ShoppingTracker:
         saved = deepcopy(self.state)
         try:
             self.apply_update(update, reply)
+        except RefundReviewError as exc:
+            self.state = saved
+            self.stage()
+            return 'No refund request was submitted. ' + str(exc)
         except (ValidationError, ValueError, TypeError):
             self.state = saved
             # Invalid optional preferences must not discard a separately valid
             # financial review. Revalidate that structured proposal on its own.
             try:
                 self.apply_update({'pending_confirmation': update.get('pending_confirmation')}, reply)
+            except RefundReviewError as exc:
+                self.state = saved
+                self.stage()
+                return 'No refund request was submitted. ' + str(exc)
             except (ValidationError, ValueError, TypeError, AttributeError):
                 self.state = saved
             self.stage()
@@ -499,6 +574,8 @@ class ShoppingTracker:
             return reply or ''
         if proposal['action'] == 'place_order':
             reply = placement_review(self.state['current_draft'])[1]
+        elif proposal['action'] == 'process_refund':
+            reply = proposal['summary']
         elif reply is None:
             reply = proposal['summary']
         elif proposal['summary'] not in reply:

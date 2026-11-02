@@ -23,7 +23,7 @@ from mcp_server.charts import chart_from_result
 from mcp_server.access import ADMIN_TOOLS, CASHIER_TOOLS, CUSTOMER_TOOLS, SCOPE_FIELDS
 from context.reply_text import plain_reply, split_reply_tables, reply_envelope
 from context.shopping_state import (ShoppingTracker, Proposal, order_snapshot,
-    canonical_proposal_arguments, proposal_details)
+    canonical_proposal_arguments, canonical_refund_arguments, proposal_details)
 from database.connection import connect
 from agent.prompts.runtime_policy import runtime_policy
 from agent.coupon_policy import customer_supplied_coupon
@@ -80,6 +80,11 @@ class TimedAzureClient(AzureOpenAIChatCompletionClient):
                     'The billing change could not be verified. Check its saved status before retrying.'
                     if workbench.uncertain_change else workbench.dispatch_problem)
                 return CreateResult(content=answer,
+                    finish_reason='stop', usage=RequestUsage(prompt_tokens=0,completion_tokens=0),cached=False)
+            if workbench is not None and workbench.refund_review:
+                # The rejected operation needs a saved review, not another SDK
+                # round trip that could repeat the same unapproved request.
+                return CreateResult(content='Review the current refund request details.',
                     finish_reason='stop', usage=RequestUsage(prompt_tokens=0,completion_tokens=0),cached=False)
             extra = dict(kwargs.get('extra_create_args', {}))
             if kwargs.get('tools'):
@@ -203,6 +208,18 @@ def customer_change(name, values):
     return None
 
 
+def approved_refund_arguments(arguments, proposal):
+    """Omitted optional fields retain the exact saved terms, never new values."""
+    values = dict(arguments)
+    if (isinstance(proposal, dict) and proposal.get('action') == 'process_refund'
+            and proposal.get('order_id') == values.get('order_id')):
+        saved = canonical_refund_arguments(proposal.get('arguments'))
+        for key in ('amount', 'items', 'disposition', 'target_order_id'):
+            if values.get(key) is None and key in saved:
+                values[key] = deepcopy(saved[key])
+    return values
+
+
 def customer_terms_error(name, arguments, proposal):
     """Check saved IDs and typed values only; the model interprets human approval.
 
@@ -225,10 +242,12 @@ def customer_terms_error(name, arguments, proposal):
     # delivery terms are bound by the saved fingerprint, not model display data.
     bound = action != 'place_order' and (action != 'cancel_order' or proposal.get('arguments') is not None or bool(arguments.get('reason')))
     try:
-        current = canonical_proposal_arguments(arguments)
+        canonical = canonical_refund_arguments if action == 'process_refund' else canonical_proposal_arguments
+        current = canonical(approved_refund_arguments(arguments, proposal)
+                            if action == 'process_refund' else arguments)
         if action == 'process_refund' and Decimal(current.get('amount','0')) <= 0:
             return 'No change was executed. A refund request needs its exact quoted positive amount.'
-        if bound and json.dumps(canonical_proposal_arguments(proposal.get('arguments')),sort_keys=True) != json.dumps(current,sort_keys=True):
+        if bound and json.dumps(canonical(proposal.get('arguments')),sort_keys=True) != json.dumps(current,sort_keys=True):
             return detail
     except (ValueError, TypeError):
         return detail
@@ -258,6 +277,24 @@ def blocked_action_reply(content, workbench, customer=False):
     visible = '\n'.join([*workbench.completed_changes, detail])
     envelope = reply_envelope(content) if customer else None
     update = envelope.get('shopping_update') if isinstance(envelope, dict) else None
+    if customer and workbench.refund_review and not workbench.completed_changes:
+        # A blocked structured request can prepare a review, never grant its own
+        # approval. The tracker quotes and validates it before saving any terms.
+        try:
+            candidate = Proposal.model_validate(update.get('pending_confirmation') if isinstance(update, dict) else None)
+            if (candidate.action == 'process_refund' and candidate.order_id == workbench.refund_review.get('order_id')
+                    and not candidate.arguments):
+                raise ValueError('Use the structured refund request terms instead of an empty review.')
+        except (ValueError, TypeError):
+            update = deepcopy(update) if isinstance(update, dict) else {}
+            try:
+                values = canonical_proposal_arguments(workbench.refund_review)
+            except (ValueError, TypeError) as exc:
+                return 'No refund request was submitted. ' + str(exc)
+            update['pending_confirmation'] = {'action':'process_refund',
+                'order_id':workbench.refund_review.get('order_id'),
+                'summary':'Review the refund request before submitting it.', 'arguments':values}
+            return json.dumps({'reply':visible, 'shopping_update':update})
     if customer and workbench.checkout_review and not workbench.completed_changes:
         # A model-selected placement without a saved approval is a request to
         # review, never permission to write. Bind the next review to its actual
@@ -433,6 +470,7 @@ class RecordingWorkbench(McpWorkbench):
         self.user_history = []
         self.action_proposal = None
         self.checkout_review = None
+        self.refund_review = None
         self.action_blocks = []
         self.completed_changes = []
         self.uncertain_change = False
@@ -735,11 +773,16 @@ class RecordingWorkbench(McpWorkbench):
             telemetry.guardrail('approval_terms', 'blocked', 'customer_terms_unavailable_or_changed')
             if name == 'place_order':
                 self.checkout_review = authorization.get('order_id')
+            elif (name == 'process_refund' and customer_change(name, authorization) == 'process_refund'
+                    and authorization.get('customer_id') == self.customer_id and self.customer_id):
+                self.refund_review = deepcopy(authorization)
             self.action_blocks.append(blocked)
             return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
                 'ok': False, 'error': blocked, 'confirmation_required': True}))])
         if self.mode == 'customer' and customer_change(name, authorization):
             telemetry.guardrail('approval_terms', 'pass', 'saved_customer_terms_match')
+            if name == 'process_refund' and customer_change(name, authorization) == 'process_refund':
+                authorization = approved_refund_arguments(authorization, self.action_proposal)
         if self.mode == 'customer' and name == 'apply_promotion':
             code = authorization.get('promo_code')
             if not customer_supplied_coupon(code, self.user_message, self.user_history, self.coupon_codes):
@@ -1040,6 +1083,7 @@ class BillingAgent:
                 workbench.receipts.clear()
                 workbench.action_blocks.clear()
                 workbench.checkout_review = None
+                workbench.refund_review = None
                 workbench.completed_changes.clear()
                 workbench.uncertain_change = False
                 workbench.completed_response_error = False
@@ -1143,14 +1187,18 @@ class BillingAgent:
                 reply = tracker.finish(content) if tracker else plain_reply(content)
                 if tracker and not (workbench.action_blocks or workbench.uncertain_change
                         or workbench.completed_response_error or workbench.dispatch_problem):
-                    placements = [change_receipt(name, args, data) for name, args, data in workbench.receipts
-                                  if name == 'place_order' and data.get('ok')]
-                    if placements:
-                        # A successful transaction has an authoritative receipt.
-                        # Free model prose must not ask to perform it again.
-                        reply = '\n'.join(placements)
+                    submitted = [change_receipt(name, args, data) for name, args, data in workbench.receipts
+                                 if data.get('ok') and (name == 'place_order' or name == 'process_refund'
+                                     and args.get('action', 'request') == 'request')]
+                    if submitted:
+                        # A successful placement/request has an authoritative
+                        # receipt; model prose must not ask to repeat it.
+                        reply = '\n'.join(submitted)
                         if workbench.failed:
-                            reply += '\n\nA tool failed during this request; some other requested results may be unavailable. The order placement above is confirmed.'
+                            receipt_status = ('The order placement above is confirmed.' if any(
+                                name == 'place_order' and data.get('ok') for name, _, data in workbench.receipts)
+                                else 'The refund request above is confirmed.')
+                            reply += '\n\nA tool failed during this request; some other requested results may be unavailable. ' + receipt_status
                         review = tracker.confirmation_review()
                         if review:
                             reply += '\n\n' + review
